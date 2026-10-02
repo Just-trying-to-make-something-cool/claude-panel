@@ -21,7 +21,7 @@
 ## Установка
 
 ```sh
-git clone git@github.com:ipeffer/claude-panel.git ~/claude/claude-settings/claude-panel
+git clone git@github.com:Just-trying-to-make-something-cool/claude-panel.git ~/claude/claude-settings/claude-panel
 ~/claude/claude-settings/claude-panel/install.sh
 ```
 
