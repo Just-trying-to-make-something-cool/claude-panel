@@ -1,0 +1,10 @@
+#!/bin/sh
+# Панель управления папками Claude. Окно (Textual) из venv проекта; служебные флаги и запасной fzf — core.py.
+ROOT="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+case "$1" in
+  --list|--dry|--preview|--fzf) [ "$1" = "--fzf" ] && shift; exec python3 "$ROOT/panel/core.py" "$@" ;;
+  --help|-h) sed -n '2,20p' "$ROOT/panel/tui.py" | sed 's/^"""//'; exit 0 ;;
+esac
+if [ -x "$ROOT/.venv/bin/python" ]; then exec "$ROOT/.venv/bin/python" "$ROOT/panel/tui.py" "$@"; fi
+echo "окружение не установлено: выполни $ROOT/install.sh (пока открываю запасной вариант на fzf)" >&2
+exec python3 "$ROOT/panel/core.py" "$@"
