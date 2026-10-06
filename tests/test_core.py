@@ -133,3 +133,19 @@ class Menu(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class Live(unittest.TestCase):
+    def test_same_session_in_two_windows_listed_once(self):
+        """Одна сессия, открытая в двух окнах, приходит из `claude agents` дважды: в списке живых она одна."""
+        import json, subprocess, types
+        two = [{'sessionId': 'a1', 'cwd': '/p', 'name': 'x', 'pid': 1}, {'sessionId': 'a1', 'cwd': '/p', 'name': 'x', 'pid': 2},
+               {'sessionId': 'b2', 'cwd': '/p', 'name': 'y', 'pid': 3}]
+        real = subprocess.run
+        subprocess.run = lambda *a, **k: types.SimpleNamespace(stdout=json.dumps(two), returncode=0)
+        try:
+            row = types.SimpleNamespace(path='/p')
+            c.add_stats([row])
+        finally:
+            subprocess.run = real
+        self.assertEqual([s['sessionId'] for s in row.live], ['a1', 'b2'])

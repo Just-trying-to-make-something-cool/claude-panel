@@ -153,7 +153,11 @@ def add_stats(rows):
     live = {}
     try:
         out = subprocess.run(['claude', 'agents', '--json'], capture_output=True, text=True, timeout=8).stdout
+        seen = set()
         for s in json.loads(out or '[]'):
+            if s.get('sessionId') in seen:      # одна сессия в двух окнах приходит дважды: окно падало на повторе id
+                continue
+            seen.add(s.get('sessionId'))
             live.setdefault(s.get('cwd'), []).append(s)
     except Exception:
         pass
