@@ -1,10 +1,11 @@
 """Панель управления папками Claude: окно в терминале (Textual). Данные и запуск — в core.py.
 
-Слева дерево ~/claude: сегменты → проекты → части. Справа карточка выбранного:
-описание, где живёт, сессии, кнопки «Продолжить», «Новая сессия», «Старые сессии»,
-список живых сессий (Enter или клик — подключиться). Мышь работает.
+Слева дерево ~/claude: сегменты → проекты → части, у проекта число сессий и когда была последняя.
+Справа карточка выбранного: описание, где живёт, файл памяти, последние сессии (имя или первая
+реплика — видно, о чём она; Enter или клик — продолжить именно её), живые сессии, кнопки
+«Продолжить», «Новая сессия», «Старые сессии», «Claude + Codex». Мышь работает.
 
-Клавиши: ↑↓ по дереву · Enter продолжить · n новая · r старые · q / Esc выход.
+Клавиши: ↑↓ по дереву · Enter продолжить · n новая · r старые · p пара с Codex · q / Esc выход.
 """
 import os, sys
 
@@ -18,7 +19,7 @@ from textual.containers import Horizontal, Vertical  # noqa: E402
 from textual.widgets import Button, Footer, Input, OptionList, Static, Tree  # noqa: E402
 from textual.widgets.option_list import Option  # noqa: E402
 
-SEG_ORDER = ['kvant-lab', 'clients', 'infra', 'personal', 'work', 'claude-settings']
+SEG_ORDER = ['kvant-lab', 'kvant-media', 'clients', 'infra', 'personal', 'work', 'claude-settings']
 SEG_NAMES = {'kvant-lab': 'KVANT LAB', 'clients': 'Клиенты', 'infra': 'Инфра', 'personal': 'Личное',
              'work': 'Разовые задачи', 'claude-settings': 'Настройки Claude'}
 DOT = {'ЖДЁТ': '[bold yellow]●[/]', 'работает': '[blue]●[/]', 'живая': '[green]●[/]', '': ''}
@@ -29,14 +30,20 @@ def status_text(r):
     return f'{DOT[s]} {s}' if s else ''
 
 
+def seg_name(r):
+    """Имя сегмента: заголовок его CLAUDE.md, иначе словарь, иначе имя папки."""
+    return c.title_of(r.path, SEG_NAMES.get(r.label, r.label)) if os.path.isdir(r.path) else SEG_NAMES.get(r.label, r.label)
+
+
 def tree_label(r):
     dot = DOT[c._status(r)]
     if r.depth == 1:
-        return f'[bold]{escape(SEG_NAMES.get(r.label, r.label))}[/]'
+        return f'[bold $accent]{escape(seg_name(r))}[/]'
     name = escape(r.label)
     if not (r.what or r.sessions) and r.depth == 2:
         name = f'[dim]{name}[/]'
-    return f'{name} {dot}'.rstrip()
+    tail = f' [dim]· {r.sessions} сесс. · {c._ago(r.last)}[/]' if r.sessions else ''
+    return f'{name}{tail} {dot}'.rstrip()
 
 
 def ordered(rows):
@@ -57,22 +64,26 @@ class Pult(App):
     CSS = """
     Screen { layout: vertical; }
     #body { height: 1fr; }
-    #tree { width: 38%; min-width: 30; border: round $primary; padding: 0 1; }
-    #card { width: 1fr; border: round $secondary; padding: 0 1; }
-    #title { text-style: bold; }
-    #what, #meta { color: $text-muted; }
+    #tree { width: 38%; min-width: 30; border: round $accent; padding: 0 1; }
+    #tree:focus { border: round $accent-lighten-2; }
+    #card { width: 1fr; border: round $secondary; padding: 0 1; background: $surface; }
+    #title { text-style: bold; color: $accent-lighten-2; }
+    #what { margin-top: 1; }
+    #meta { color: $text-muted; }
     #buttons { height: auto; margin: 1 0; }
     #buttons Button { margin-right: 1; min-width: 14; }
     #name_box { height: auto; display: none; }
     #name_box.show { display: block; }
-    #live_h { margin-top: 1; text-style: bold; }
-    #live { height: auto; max-height: 10; border: none; }
+    #recent_h, #live_h { margin-top: 1; text-style: bold; color: $text-muted; }
+    #live_h { color: $warning; }
+    #recent, #live { height: auto; max-height: 9; border: none; }
     #hint { color: $text-muted; margin-top: 1; }
     """
     BINDINGS = [
         Binding('q', 'quit', 'выход'), Binding('escape', 'quit', 'выход', show=False),
         Binding('enter', 'go_continue', 'продолжить', priority=False),
         Binding('n', 'go_new', 'новая сессия'), Binding('r', 'go_resume', 'старые сессии'),
+        Binding('p', 'go_pair', 'пара с Codex'),
     ]
 
     def __init__(self, rows):
@@ -102,12 +113,15 @@ class Pult(App):
                 yield Static('', id='what')
                 yield Static('', id='meta')
                 with Horizontal(id='buttons'):
-                    yield Button('Продолжить', id='continue', variant='primary')
-                    yield Button('Новая сессия', id='new')
+                    yield Button('Продолжить', id='continue', variant='success')
+                    yield Button('Новая сессия', id='new', variant='primary')
                     yield Button('Старые сессии', id='resume')
+                    yield Button('Claude + Codex', id='pair', variant='warning')
                 with Vertical(id='name_box'):
                     yield Static('', id='name_label')
                     yield Input(placeholder='направление, например «бизнес» (можно пусто)', id='name')
+                yield Static('Последние сессии  [dim]Enter — продолжить именно её[/]', id='recent_h')
+                yield OptionList(id='recent')
                 yield Static('Живые сессии', id='live_h')
                 yield OptionList(id='live')
                 yield Static('', id='hint')
@@ -120,18 +134,25 @@ class Pult(App):
     # ---------- карточка ----------
     def show(self, r):
         self.current = r
-        self.query_one('#title', Static).update(f'{escape(r.label)}  [dim]{escape(r.path.replace(c.H, "~"))}[/]')
-        self.query_one('#what', Static).update(escape(r.what) or '')
+        title = escape(seg_name(r)) if r.depth == 1 else escape(r.label)
+        self.query_one('#title', Static).update(f'{title}  [dim]{escape(r.path.replace(c.H, "~"))}[/]')
+        self.query_one('#what', Static).update(escape(r.what) or '[dim]описания нет: добавь строку в таблицу CLAUDE.md сегмента[/]')
         meta = []
         if r.where:
             meta.append(f'где живёт: {escape(r.where)}')
+        if r.memo:
+            meta.append(f'память: {escape(r.memo)}')
         meta.append(f'сессий: {r.sessions}' + (f', последняя {c._ago(r.last)}' if r.last else ''))
-        names = c.session_names(r.path, 3) if r.sessions else []
-        if names:
-            meta.append('последние: ' + ' · '.join(escape(n) for n in names))
         self.query_one('#meta', Static).update('\n'.join(meta))
         self.query_one('#continue', Button).label = 'Продолжить' if r.sessions else 'Начать здесь'
         self.query_one('#resume', Button).display = bool(r.sessions)
+        recent = self.query_one('#recent', OptionList)
+        recent.clear_options()
+        infos = c.session_info(r.path, 6) if r.sessions else []
+        for sid, name, when in infos:
+            recent.add_option(Option(f'[dim]{escape(when):>8}[/]  {escape(name)}', id=f'attach:{sid}'))
+        self.query_one('#recent_h').display = bool(infos)
+        recent.display = bool(infos)
         live = self.query_one('#live', OptionList)
         live.clear_options()
         for s in r.live:
@@ -156,7 +177,7 @@ class Pult(App):
         self.exit((self.current, action, name))
 
     def action_go_continue(self):
-        if self.focused is not None and self.focused.id in ('name', 'live'):
+        if self.focused is not None and self.focused.id in ('name', 'live', 'recent'):
             return
         if self.current.depth >= 2 or self.current.depth == 0:
             self.finish('continue')
@@ -178,6 +199,12 @@ class Pult(App):
         if self.current.sessions:
             self.finish('resume')
 
+    def action_go_pair(self):
+        if self.focused is not None and self.focused.id == 'name':
+            return
+        if self.current.depth >= 2 or self.current.depth == 0:
+            self.finish('pair')
+
     def action_quit(self):
         if self.query_one('#name_box').has_class('show'):
             self.query_one('#name_box').remove_class('show')
@@ -186,7 +213,8 @@ class Pult(App):
         self.exit(None)
 
     def on_button_pressed(self, ev: Button.Pressed):
-        {'continue': self.action_go_continue, 'new': self.action_go_new, 'resume': self.action_go_resume}[ev.button.id]()
+        {'continue': self.action_go_continue, 'new': self.action_go_new, 'resume': self.action_go_resume,
+         'pair': self.action_go_pair}[ev.button.id]()
 
     def on_input_submitted(self, ev: Input.Submitted):
         self.finish('new', c.session_name(self.current, ev.value.strip()))
