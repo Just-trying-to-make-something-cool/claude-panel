@@ -51,12 +51,36 @@ def parse_table(md):
     return out
 
 
-def _table_of(dirpath):
+def _md_of(dirpath):
     try:
         with open(os.path.join(dirpath, 'CLAUDE.md'), encoding='utf-8') as fh:
-            return parse_table(fh.read())
+            return fh.read()
     except OSError:
-        return {}
+        return ''
+
+
+def _table_of(dirpath):
+    return parse_table(_md_of(dirpath))
+
+
+def parse_memo(md):
+    """{имя папки: четвёртая колонка таблицы} — файл памяти проекта, если колонка есть."""
+    out = {}
+    for line in md.splitlines():
+        if not line.startswith('|') or set(line.replace('|', '').strip()) <= set('-: '):
+            continue
+        cells = [_clean(x) for x in line.strip().strip('|').split('|')]
+        if len(cells) >= 4 and cells[0].strip():
+            out[cells[0].rstrip('/').split()[0]] = cells[3]
+    return out
+
+
+def title_of(dirpath, fallback=''):
+    """Имя сегмента для окна: заголовок `# …` из его CLAUDE.md, иначе имя папки."""
+    for line in _md_of(dirpath).splitlines():
+        if line.startswith('# '):
+            return line[2:].strip()
+    return fallback or os.path.basename(dirpath)
 
 
 @dataclasses.dataclass
@@ -67,6 +91,7 @@ class Row:
     what: str = ''
     where: str = ''
     project: str = ''   # имя проекта для имени сессии
+    memo: str = ''      # файл памяти проекта (четвёртая колонка таблицы), если есть
     sessions: int = 0
     last: float = 0.0
     live: list = dataclasses.field(default_factory=list)
@@ -93,10 +118,11 @@ def discover(root=ROOT):
         what, where = seg_desc.get(seg, ('', ''))
         rows.append(Row(sp, 1, seg, what, where, seg))
         proj_desc = _table_of(sp)
+        proj_memo = parse_memo(_md_of(sp))
         for proj in _subdirs(sp):
             pp = os.path.join(sp, proj)
             what, where = proj_desc.get(proj, ('', ''))
-            rows.append(Row(pp, 2, proj, what, where, proj))
+            rows.append(Row(pp, 2, proj, what, where, proj, proj_memo.get(proj, '')))
             part_desc = _table_of(pp)
             for wt in _subdirs(os.path.join(pp, '.claude', 'worktrees')):
                 rows.append(Row(os.path.join(pp, '.claude', 'worktrees', wt), 3, wt,
@@ -127,7 +153,11 @@ def add_stats(rows):
     live = {}
     try:
         out = subprocess.run(['claude', 'agents', '--json'], capture_output=True, text=True, timeout=8).stdout
+        seen = set()
         for s in json.loads(out or '[]'):
+            if s.get('sessionId') in seen:      # одна сессия в двух окнах приходит дважды: окно падало на повторе id
+                continue
+            seen.add(s.get('sessionId'))
             live.setdefault(s.get('cwd'), []).append(s)
     except Exception:
         pass
@@ -150,18 +180,60 @@ def add_stats(rows):
 
 def session_names(path, n=6):
     """Имена последних сессий папки, свежие первыми (из хвоста стенограмм)."""
-    names = []
+    return [name for _, name, _ in session_info(path, n)]
+
+
+_SKIP = ('<system-reminder', '<local-command', '<command-', '<task-notification', 'Caveat:', '[Request interrupted',
+         'Base directory for this skill', 'This session is being continued')
+
+
+def _first_ask(f, limit=90):
+    """Первая реплика человека в стенограмме: по ней видно, о чём сессия, когда имени нет."""
+    try:
+        with open(f, encoding='utf-8', errors='replace') as fh:
+            for i, line in enumerate(fh):
+                if i > 400:
+                    break
+                if '"type":"user"' not in line and '"type": "user"' not in line:
+                    continue
+                try:
+                    r = json.loads(line)
+                except ValueError:
+                    continue
+                if r.get('isSidechain') or r.get('isMeta'):
+                    continue
+                m = r.get('message') or {}
+                content = m.get('content')
+                if isinstance(content, list):
+                    content = ' '.join(x.get('text', '') for x in content if isinstance(x, dict) and x.get('type') == 'text')
+                text = ' '.join(str(content or '').split())
+                if text and not text.startswith(_SKIP):
+                    return text if len(text) <= limit else text[:limit - 1] + '…'
+    except OSError:
+        pass
+    return ''
+
+
+def session_info(path, n=6):
+    """Последние сессии папки: [(id, подпись, когда)] — имя сессии, иначе её первая реплика."""
+    out = []
     files = sorted(glob.glob(os.path.join(PROJECTS, encode(path), '*.jsonl')), key=os.path.getmtime, reverse=True)
     for f in files[:n]:
-        try:
-            with open(f, 'rb') as fh:
-                fh.seek(max(0, os.path.getsize(f) - 4096))
-                tail = fh.read().decode('utf-8', 'ignore')
-        except OSError:
-            continue
-        m = re.findall(r'"customTitle":"((?:[^"\\]|\\.)*)"', tail) or re.findall(r'"agentName":"((?:[^"\\]|\\.)*)"', tail)
-        names.append(m[-1] if m else 'без имени')
-    return names
+        sid = os.path.basename(f)[:-6]
+        names = session_names_of(f)
+        out.append((sid, names or _first_ask(f) or 'без имени', _ago(os.path.getmtime(f))))
+    return out
+
+
+def session_names_of(f):
+    try:
+        with open(f, 'rb') as fh:
+            fh.seek(max(0, os.path.getsize(f) - 4096))
+            tail = fh.read().decode('utf-8', 'ignore')
+    except OSError:
+        return ''
+    m = re.findall(r'"customTitle":"((?:[^"\\]|\\.)*)"', tail) or re.findall(r'"agentName":"((?:[^"\\]|\\.)*)"', tail)
+    return m[-1] if m else ''
 
 
 def _ago(ts):
@@ -295,12 +367,28 @@ def launch(row, action, name=''):
         args = ['claude', '-r', action.split(':', 1)[1]]
     elif action == 'new':
         args = ['claude', '-n', name or session_name(row, '')]
+    elif action == 'pair':          # два окна: Claude слева, Codex-ревьюер справа (команда rev из claude-setup)
+        print(f'{DIM}→ rev {row.path.replace(H, "~")}{RST}', file=sys.stderr)
+        if os.environ.get('C_DRY'):
+            return
+        os.execvp('rev', ['rev', row.path])
     else:
         args = ['claude', '-c'] if row.sessions else ['claude', '-n', session_name(row, '')]
+    if pair_on():                   # это окно станет левым с Claude, Codex-ревьюер откроется справа
+        print(f'{DIM}→ {row.path.replace(H, "~")}  rev --here · claude {" ".join(args[1:])}{RST}', file=sys.stderr)
+        if os.environ.get('C_DRY'):
+            return
+        os.execvp('rev', ['rev', '--here', row.path] + args[1:])
     print(f'{DIM}→ {row.path.replace(H, "~")}  claude {" ".join(args[1:])}{RST}', file=sys.stderr)
     if os.environ.get('C_DRY'):
         return
     os.execvp('claude', args)
+
+
+def pair_on():
+    """Открывать Codex-ревьюера рядом с каждой сессией: файл ~/.claude/pair-codex или C_PAIR=1, и команда rev есть."""
+    want = os.environ.get('C_PAIR', '1' if os.path.exists(H + '/.claude/pair-codex') else '0') == '1'
+    return want and any(os.path.exists(os.path.join(p, 'rev')) for p in os.environ.get('PATH', '').split(':'))
 
 
 def ask_name(row):
