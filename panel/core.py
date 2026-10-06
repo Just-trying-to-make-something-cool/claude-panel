@@ -370,10 +370,21 @@ def launch(row, action, name=''):
         os.execvp('rev', ['rev', row.path])
     else:
         args = ['claude', '-c'] if row.sessions else ['claude', '-n', session_name(row, '')]
+    if pair_on():                   # это окно станет левым с Claude, Codex-ревьюер откроется справа
+        print(f'{DIM}→ {row.path.replace(H, "~")}  rev --here · claude {" ".join(args[1:])}{RST}', file=sys.stderr)
+        if os.environ.get('C_DRY'):
+            return
+        os.execvp('rev', ['rev', '--here', row.path] + args[1:])
     print(f'{DIM}→ {row.path.replace(H, "~")}  claude {" ".join(args[1:])}{RST}', file=sys.stderr)
     if os.environ.get('C_DRY'):
         return
     os.execvp('claude', args)
+
+
+def pair_on():
+    """Открывать Codex-ревьюера рядом с каждой сессией: файл ~/.claude/pair-codex или C_PAIR=1, и команда rev есть."""
+    want = os.environ.get('C_PAIR', '1' if os.path.exists(H + '/.claude/pair-codex') else '0') == '1'
+    return want and any(os.path.exists(os.path.join(p, 'rev')) for p in os.environ.get('PATH', '').split(':'))
 
 
 def ask_name(row):
