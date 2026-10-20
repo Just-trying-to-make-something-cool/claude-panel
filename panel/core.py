@@ -372,8 +372,10 @@ def launch(row, action, name=''):
         if os.environ.get('C_DRY'):
             return
         os.execvp('rev', ['rev', row.path])
-    else:
-        args = ['claude', '-c'] if row.sessions else ['claude', '-n', session_name(row, '')]
+    else:                           # -c сразу выходит, когда последняя сессия папки идёт в фоне; -r по id её открывает
+        files = glob.glob(os.path.join(PROJECTS, encode(row.path), '*.jsonl'))
+        last = os.path.basename(max(files, key=os.path.getmtime))[:-6] if files else ''
+        args = ['claude', '-r', last] if last else ['claude', '-n', session_name(row, '')]
     if pair_on():                   # это окно станет левым с Claude, Codex-ревьюер откроется справа
         print(f'{DIM}→ {row.path.replace(H, "~")}  rev --here · claude {" ".join(args[1:])}{RST}', file=sys.stderr)
         if os.environ.get('C_DRY'):
