@@ -261,7 +261,11 @@ class Pult(App):
         self.query_one('#resume', Button).display = bool(r.sessions)
         live = self.query_one('#live', OptionList)
         live.clear_options()
+        seen = set()
         for s in r.live:
+            if s.get('sessionId') in seen:      # страховка: повтор id валит OptionList
+                continue
+            seen.add(s.get('sessionId'))
             tag = 'ждёт ответа' if s['blocked'] else STATES.get(s.get('state'), s.get('state') or '')
             live.add_option(Option(f'{DOT["ЖДЁТ" if s["blocked"] else "живая"]} {escape(s.get("name") or "")}  [dim]{tag}[/]',
                                    id=f'attach:{s.get("sessionId")}'))
