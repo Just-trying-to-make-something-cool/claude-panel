@@ -127,6 +127,30 @@ class Menu(unittest.TestCase):
         codes = [k for k, _ in c.menu_items(r, [r])]
         self.assertIn('attach:abc', codes)
 
+
+class Live(unittest.TestCase):
+    def test_same_session_in_two_processes_is_one_entry(self):
+        # фоновая джоба и `claude --resume` той же сессии в терминале: claude agents отдаёт обе
+        agents = [{'cwd': '/c', 'sessionId': 'x', 'name': 'root · линкедин', 'state': 'blocked', 'kind': 'background'},
+                  {'cwd': '/c', 'sessionId': 'x', 'name': 'claude-41', 'status': 'busy', 'kind': 'interactive'},
+                  {'cwd': '/c', 'sessionId': 'y', 'name': 'rop', 'state': 'working'}]
+        live = c.group_live(agents)
+        self.assertEqual([s['sessionId'] for s in live['/c']], ['x', 'y'])
+        self.assertEqual(live['/c'][0]['name'], 'root · линкедин')
+        self.assertTrue(live['/c'][0]['blocked'])
+        self.assertFalse(live['/c'][1]['blocked'])
+
+    def test_generic_name_replaced_and_interactive_busy_is_working(self):
+        agents = [{'cwd': '/c', 'sessionId': 'z', 'name': 'claude-7', 'status': 'busy'},
+                  {'cwd': '/c', 'sessionId': 'z', 'name': 'takt · оценка', 'state': 'idle'}]
+        live = c.group_live(agents)
+        self.assertEqual(live['/c'][0]['name'], 'takt · оценка')
+        self.assertEqual(c._status(c.Row('/c', 2, 'c', live=live['/c'])), 'работает')
+
+    def test_blocked_from_job_state(self):
+        live = c.group_live([{'cwd': '/c', 'sessionId': 'q', 'name': 'n', 'state': 'working'}], blocked={'q'})
+        self.assertTrue(live['/c'][0]['blocked'])
+
     def test_plain_strips_colors(self):
         self.assertEqual(c.plain(['/p\t\033[1mx\033[0m y']), ['x y'])
 

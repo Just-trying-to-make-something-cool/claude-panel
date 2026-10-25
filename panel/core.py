@@ -123,12 +123,36 @@ def session_name(row, query):
     return f'{base} · {query}' if query else base
 
 
+GENERIC_NAME = re.compile(r'^claude-\d+$')   # так claude agents зовёт сессию без имени
+
+
+def group_live(agents, blocked=()):
+    """{cwd: [живые сессии]} — по одной записи на сессию. Одна сессия бывает открыта в двух
+    процессах (фоновая джоба и `claude --resume` в терминале), и claude agents отдаёт обе."""
+    out, by_id = {}, {}
+    for s in agents:
+        sid = s.get('sessionId')
+        state = s.get('state') or s.get('status') or ''
+        e = dict(s, state=state, blocked=sid in blocked or state == 'blocked')
+        old = by_id.get(sid) if sid else None
+        if old is None:
+            if sid:
+                by_id[sid] = e
+            out.setdefault(s.get('cwd'), []).append(e)
+            continue
+        old['blocked'] = old['blocked'] or e['blocked']
+        if state in ('busy', 'working'):
+            old['state'] = state
+        if GENERIC_NAME.match(old.get('name') or '') and e.get('name'):
+            old['name'] = e['name']
+    return out
+
+
 def add_stats(rows):
-    live = {}
+    agents = []
     try:
         out = subprocess.run(['claude', 'agents', '--json'], capture_output=True, text=True, timeout=8).stdout
-        for s in json.loads(out or '[]'):
-            live.setdefault(s.get('cwd'), []).append(s)
+        agents = json.loads(out or '[]')
     except Exception:
         pass
     blocked = set()
@@ -140,12 +164,12 @@ def add_stats(rows):
                 blocked.add(s.get('sessionId'))
         except Exception:
             pass
+    live = group_live(agents, blocked)
     for r in rows:
         files = glob.glob(os.path.join(PROJECTS, encode(r.path), '*.jsonl'))
         r.sessions = len(files)
         r.last = max((os.path.getmtime(f) for f in files), default=0.0)
-        r.live = [dict(s, blocked=s.get('sessionId') in blocked or s.get('state') == 'blocked')
-                  for s in live.get(r.path, [])]
+        r.live = live.get(r.path, [])
     return rows
 
 

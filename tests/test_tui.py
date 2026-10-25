@@ -65,6 +65,15 @@ class Tui(unittest.IsolatedAsyncioTestCase):
             await pilot.press('r')
         self.assertEqual(app.return_value[1], 'resume')
 
+    async def test_duplicate_live_session_does_not_crash(self):
+        root, rows = make_tree()
+        rows[0].live = [{'sessionId': 'x', 'name': 'root · линкедин', 'state': 'blocked', 'blocked': True},
+                        {'sessionId': 'x', 'name': 'claude-41', 'state': 'busy', 'blocked': True}]
+        app = c_tui.Pult(rows)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            self.assertEqual(app.query_one('#live').option_count, 1)
+
     async def test_q_quits_without_result(self):
         root, rows = make_tree()
         app = c_tui.Pult(rows)
