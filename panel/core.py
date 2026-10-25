@@ -148,6 +148,15 @@ def group_live(agents, blocked=()):
     return out
 
 
+def open_action(sid, live, kind='session'):
+    """Как открыть сессию: живую фоновую — `claude attach <id>`, иначе `claude -r` открыл бы
+    второй процесс той же сессии; остальные — `claude -r <sessionId>`."""
+    s = next((s for s in live if s.get('sessionId') == sid), None)
+    if s and s.get('kind') == 'background' and s.get('id'):
+        return f'bg:{s["id"]}'
+    return f'{kind}:{sid}'
+
+
 def add_stats(rows):
     agents = []
     try:
@@ -418,7 +427,7 @@ def menu_items(row, rows):
         items.append(('resume', f'↺  Старые сессии этой папки  {DIM}({row.sessions}){RST}'))
     for s in row.live:
         tag = 'ждёт ответа' if s['blocked'] else (s.get('state') or '')
-        items.append((f'attach:{s.get("sessionId")}', f'⟲  Подключиться к живой: {s.get("name")}  {DIM}{tag}{RST}'))
+        items.append((open_action(s.get('sessionId'), row.live, 'attach'), f'⟲  Подключиться к живой: {s.get("name")}  {DIM}{tag}{RST}'))
     parts = [p for p in rows if p.depth == row.depth + 1 and p.path.startswith(row.path + '/') and visible(p)]
     if parts:
         items.append(('sep', DIM + '── ' + ('части' if row.depth >= 2 else 'внутри') + ' ──' + RST))
@@ -473,6 +482,8 @@ def launch(row, action, name=''):
     os.chdir(row.path)
     if action == 'resume':
         args = ['claude', '-r']
+    elif action.startswith('bg:'):
+        args = ['claude', 'attach', action[3:]]
     elif action.startswith(('attach:', 'session:')):
         args = ['claude', '-r', action.split(':', 1)[1]]
     elif action == 'new':

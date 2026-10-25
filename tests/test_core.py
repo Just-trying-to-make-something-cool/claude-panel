@@ -127,6 +127,9 @@ class Menu(unittest.TestCase):
         codes = [k for k, _ in c.menu_items(r, [r])]
         self.assertIn('attach:abc', codes)
 
+    def test_plain_strips_colors(self):
+        self.assertEqual(c.plain(['/p\t\033[1mx\033[0m y']), ['x y'])
+
 
 class Live(unittest.TestCase):
     def test_same_session_in_two_processes_is_one_entry(self):
@@ -151,8 +154,28 @@ class Live(unittest.TestCase):
         live = c.group_live([{'cwd': '/c', 'sessionId': 'q', 'name': 'n', 'state': 'working'}], blocked={'q'})
         self.assertTrue(live['/c'][0]['blocked'])
 
-    def test_plain_strips_colors(self):
-        self.assertEqual(c.plain(['/p\t\033[1mx\033[0m y']), ['x y'])
+class OpenSession(unittest.TestCase):
+    def test_live_background_session_is_attached_not_resumed(self):
+        live = [{'sessionId': 'a4ff9cb7-e4fe', 'id': 'a4ff9cb7', 'kind': 'background', 'blocked': False}]
+        self.assertEqual(c.open_action('a4ff9cb7-e4fe', live), 'bg:a4ff9cb7')
+
+    def test_interactive_or_finished_session_is_resumed(self):
+        live = [{'sessionId': 'x', 'id': None, 'kind': 'interactive', 'blocked': False}]
+        self.assertEqual(c.open_action('x', live), 'session:x')
+        self.assertEqual(c.open_action('y', live), 'session:y')
+        self.assertEqual(c.open_action('x', live, 'attach'), 'attach:x')
+
+    def test_launch_bg_runs_claude_attach(self):
+        import contextlib, io
+        d = tempfile.mkdtemp()
+        err = io.StringIO()
+        os.environ['C_DRY'] = '1'
+        try:
+            with contextlib.redirect_stderr(err):
+                c.launch(c.Row(d, 2, 'p'), 'bg:a4ff9cb7')
+        finally:
+            os.environ.pop('C_DRY')
+        self.assertIn('claude attach a4ff9cb7', err.getvalue())
 
 
 if __name__ == '__main__':
