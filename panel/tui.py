@@ -268,7 +268,7 @@ class Pult(App):
             seen.add(s.get('sessionId'))
             tag = 'ждёт ответа' if s['blocked'] else STATES.get(s.get('state'), s.get('state') or '')
             live.add_option(Option(f'{DOT["ЖДЁТ" if s["blocked"] else "живая"]} {escape(s.get("name") or "")}  [dim]{tag}[/]',
-                                   id=f'attach:{s.get("sessionId")}'))
+                                   id=c.open_action(s.get('sessionId'), r.live, 'attach')))
         self.query_one('#live_h').display = bool(r.live)
         live.display = bool(r.live)
         if r.sessions:
@@ -374,7 +374,8 @@ class Pult(App):
     def on_option_list_option_selected(self, ev: OptionList.OptionSelected):
         if not ev.option.id:
             return
-        self.finish(f'session:{ev.option.id}' if ev.option_list.id == 'sessions' else ev.option.id)
+        sessions = ev.option_list.id == 'sessions'
+        self.finish(c.open_action(ev.option.id, self.current.live) if sessions else ev.option.id)
 
     # ---------- действия ----------
     def finish(self, action, name=''):

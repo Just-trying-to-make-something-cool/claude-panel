@@ -185,6 +185,17 @@ class SessionList(unittest.IsolatedAsyncioTestCase):
             con.print(app.query_one('#detail').content)
             self.assertIn('ждёт вашего ответа', con.export_text())
 
+    async def test_enter_on_live_background_session_attaches(self):
+        # claude -r на живую фоновую сессию открыл бы второй процесс той же сессии
+        self.takt.live = [{'sessionId': 'new2', 'id': 'new2abc', 'kind': 'background', 'name': 'takt · оценка',
+                           'state': 'working', 'blocked': False}]
+        app = c_tui.Pult(self.rows)
+        async with app.run_test(size=(140, 45)) as pilot:
+            await self.open_takt(app, pilot)
+            app.query_one('#sessions').focus()
+            await pilot.press('enter')
+        self.assertEqual(app.return_value[1], 'bg:new2abc')
+
     async def test_escape_from_sessions_goes_back_to_tree(self):
         app = c_tui.Pult(self.rows)
         async with app.run_test(size=(140, 45)) as pilot:
