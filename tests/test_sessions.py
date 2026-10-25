@@ -83,6 +83,13 @@ class Detail(unittest.TestCase):
         d = c.session_detail(p, root=ROOT)
         self.assertEqual((d['error'], d['last_answer']), ('', 'Продолжаю, готово.'))
 
+    def test_answer_by_tool_call_is_not_unanswered(self):
+        # автоматические прогоны кончаются вызовом инструмента без текста
+        tool = {'type': 'assistant', 'message': {'content': [{'type': 'tool_use', 'name': 'StructuredOutput', 'input': {}}]}}
+        result = {'type': 'user', 'message': {'content': [{'type': 'tool_result', 'content': 'ok'}]}}
+        p = write([user('Ситуация: лид ответил «давайте завтра»'), tool, result])
+        self.assertEqual(c.session_detail(p, root=ROOT)['error'], '')
+
     def test_normal_ending_has_answer_and_no_error(self):
         p = write([user('оцени ТЗ'), answer('Оценка готова: этап А за 2 недели.')])
         d = c.session_detail(p, root=ROOT)
@@ -101,7 +108,92 @@ class Detail(unittest.TestCase):
         self.assertEqual(d['places'][0][1], 60)
 
 
+def api_error(text, code, **kw):
+    return answer(text, isApiErrorMessage=True, error=code, **kw)
+
+
+class Errors(unittest.TestCase):
+    def test_rate_limit_by_field_keeps_last_real_answer(self):
+        p = write([user('оцени ТЗ'), answer('Оценка готова.'), user('продолжи'),
+                   api_error("You've hit your session limit · resets 3pm", 'rate_limit')])
+        d = c.session_detail(p, root=ROOT)
+        self.assertEqual((d['error'], d['last_answer']), ('лимит', 'Оценка готова.'))
+
+    def test_auth_and_other_codes(self):
+        p = write([user('a'), api_error('Your organization has disabled Claude subscription access', 'oauth_org_not_allowed')])
+        self.assertEqual(c.session_detail(p, root=ROOT)['error'], 'ошибка входа')
+        p = write([user('a'), api_error('model not found', 'model_not_found')])
+        self.assertEqual(c.session_detail(p, root=ROOT)['error'], 'ошибка API')
+
+    def test_answer_mentioning_api_error_is_normal(self):
+        p = write([user('что в логе?'), answer('В логе есть API Error: 500 от Яндекса, это их сбой.')])
+        d = c.session_detail(p, root=ROOT)
+        self.assertEqual(d['error'], '')
+        self.assertTrue(d['last_answer'].startswith('В логе есть API Error'))
+
+
+class BigFiles(unittest.TestCase):
+    """Окна чтения: файлы крупнее начального окна и хвоста."""
+    filler = staticmethod(lambda n: [answer('x' * 1000) for _ in range(n)])   # ~1,2 КБ на строку
+
+    def test_rename_in_tail_of_big_file_wins_over_head(self):
+        p = write([{'type': 'custom-title', 'customTitle': 'старое'}, user('x')] + self.filler(700)
+                  + [{'type': 'custom-title', 'customTitle': 'новое'}])
+        self.assertGreater(os.path.getsize(p), 3 * c.HEAD)
+        self.assertEqual(c.session_brief(p)['title'], 'новое')
+
+    def test_title_between_head_and_tail_windows_is_found(self):
+        # 256–320 КБ: раньше хвост не читался вовсе
+        p = write([user('x')] + self.filler(225) + [{'type': 'custom-title', 'customTitle': 'середина'}] + self.filler(20))
+        self.assertTrue(c.HEAD < os.path.getsize(p) < c.HEAD + c.TAIL + 40000)
+        self.assertEqual(c.session_brief(p)['title'], 'середина')
+
+    def test_first_prompt_after_head_window(self):
+        p = write(self.filler(400) + [user('настоящий первый запрос')] + self.filler(10))
+        self.assertEqual(c.session_brief(p)['first'], 'настоящий первый запрос')
+
+    def test_continuation_session_says_so(self):
+        p = write([user('This session is being continued from a previous conversation that ran out of context.')]
+                  + self.filler(10))
+        self.assertEqual(c.session_brief(p)['first'], c.CONTINUED)
+
+    def test_continuation_summary_beyond_second_window(self):
+        p = write(self.filler(1900) + [dict(user('This session is being continued from a previous conversation.'),
+                                            isCompactSummary=True), user('продолжай')])
+        self.assertGreater(os.path.getsize(p), c.HEAD_MAX)
+        self.assertEqual(c.session_brief(p)['first'], c.CONTINUED)
+
+    def test_detail_window_grows_to_reach_last_prompt(self):
+        p = write([user('первый'), user('последний запрос')] + self.filler(700))
+        self.assertEqual(c.session_detail(p, root=ROOT)['last_user'], 'последний запрос')
+
+    def test_non_object_json_lines_do_not_crash(self):
+        d = tempfile.mkdtemp()
+        p = os.path.join(d, 's.jsonl')
+        with open(p, 'w', encoding='utf-8') as fh:
+            fh.write('[1, 2]\n"строка"\n42\n' + json.dumps(user('привет'), ensure_ascii=False) + '\n')
+        self.assertEqual(c.session_brief(p)['first'], 'привет')
+        self.assertEqual(c.session_detail(p, root=ROOT)['last_user'], 'привет')
+
+    def test_cache_keeps_one_entry_per_file(self):
+        p = write([user('a')])
+        c.session_brief(p)
+        with open(p, 'a', encoding='utf-8') as fh:
+            fh.write(json.dumps(user('b'), ensure_ascii=False) + '\n')
+        c.session_brief(p)
+        self.assertEqual(sum(1 for k in c._cache if k[0] == 'brief' and k[1] == p), 1)
+
+
 class Folder(unittest.TestCase):
+    def test_vanished_file_is_skipped(self):
+        projects = tempfile.mkdtemp()
+        folder = os.path.join(projects, c.encode('/Users/x/claude/kvant-lab'))
+        os.makedirs(folder)
+        write([user('живая')], folder, 'ok')
+        os.symlink(os.path.join(folder, 'нет.jsonl'), os.path.join(folder, 'gone.jsonl'))   # glob видит, stat падает
+        files = c.folder_sessions('/Users/x/claude/kvant-lab', projects=projects)
+        self.assertEqual([os.path.basename(f) for f in files], ['ok.jsonl'])
+
     def test_sessions_newest_first_with_limit(self):
         projects = tempfile.mkdtemp()
         folder = os.path.join(projects, c.encode('/Users/x/claude/kvant-lab'))

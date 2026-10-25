@@ -21,6 +21,14 @@ def make_tree():
     return root, rows
 
 
+class Markup(unittest.TestCase):
+    def test_esc_survives_any_text(self):
+        from textual.content import Content
+        for raw in ['скажи [Im', 'arr[i', 'C:\\', 'a\\[b', '[bold]x', 'см. [1', '[/]', 'x]']:
+            plain = Content.from_markup(f'[bold]{c_tui.esc(raw)}[/]  [dim]y[/]').plain
+            self.assertIn(raw.replace('\\', '').rstrip('\\')[:3], plain)
+
+
 class Order(unittest.TestCase):
     def test_kvant_lab_first_then_clients(self):
         root, rows = make_tree()
@@ -73,6 +81,33 @@ class Tui(unittest.IsolatedAsyncioTestCase):
         async with app.run_test() as pilot:
             await pilot.pause()
             self.assertEqual(app.query_one('#live').option_count, 1)
+
+    async def test_enter_on_root_with_sessions_continues(self):
+        root, rows = make_tree()
+        rows[0].sessions, rows[0].last = 11, 1.0
+        app = c_tui.Pult(rows)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press('enter')
+        row, action, name = app.return_value
+        self.assertEqual((row.depth, action), (0, 'continue'))
+
+    async def test_live_entries_without_session_id_are_all_shown(self):
+        root, rows = make_tree()
+        rows[0].live = [{'sessionId': None, 'name': 'a', 'state': 'working', 'blocked': False},
+                        {'sessionId': None, 'name': 'b', 'state': 'working', 'blocked': False}]
+        app = c_tui.Pult(rows)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            self.assertEqual(app.query_one('#live').option_count, 2)
+
+    async def test_bracket_in_names_does_not_crash(self):
+        root, rows = make_tree()
+        rows[0].live = [{'sessionId': 's', 'name': 'takt [черновик', 'state': 'working', 'blocked': False}]
+        app = c_tui.Pult(rows)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            self.assertIn('[черновик', str(app.query_one('#live').get_option_at_index(0).prompt))
 
     async def test_q_quits_without_result(self):
         root, rows = make_tree()
@@ -195,6 +230,48 @@ class SessionList(unittest.IsolatedAsyncioTestCase):
             app.query_one('#sessions').focus()
             await pilot.press('enter')
         self.assertEqual(app.return_value[1], 'bg:new2abc')
+
+    async def test_cut_bracket_in_first_prompt_does_not_crash(self):
+        folder = os.path.join(self.projects, c.encode(self.takt.path))
+        with open(os.path.join(folder, 'old1.jsonl'), 'w', encoding='utf-8') as fh:
+            fh.write(json.dumps({'type': 'user', 'cwd': self.takt.path, 'timestamp': '2026-10-23T13:18:58Z', 'message':
+                                 {'content': 'посмотри на эту картинку пожалуйста и скажи [Image #2] что на ней'}},
+                                ensure_ascii=False) + '\n')
+        os.utime(os.path.join(folder, 'old1.jsonl'), (1000, 1000))
+        app = c_tui.Pult(self.rows)
+        async with app.run_test(size=(140, 45)) as pilot:
+            await self.open_takt(app, pilot)
+            lst = app.query_one('#sessions')
+            self.assertEqual(lst.option_count, 2)
+            lst.highlighted = 1
+            await pilot.pause()
+            app.save_screenshot(os.path.join(tempfile.mkdtemp(), 'x.svg'))   # отрисовка разметки
+        self.assertIsNone(app.return_value)
+
+    async def test_results_of_previous_folder_are_ignored(self):
+        app = c_tui.Pult(self.rows)
+        async with app.run_test(size=(140, 45)) as pilot:
+            await self.open_takt(app, pilot)
+            other = next(r for r in self.rows if r.label == 'sova')
+            brief = dict(c.session_brief(next(iter(c.folder_sessions(self.takt.path)))), id='чужая')
+            app.fill_sessions(other, [brief])
+            app.fill_detail(other, 'new2', {'last_user': 'чужое', 'last_answer': '', 'error': '', 'branch': '', 'places': []})
+            await pilot.pause()
+            lst = app.query_one('#sessions')
+            self.assertEqual([lst.get_option_at_index(i).id for i in range(lst.option_count)], ['new2', 'old1'])
+            self.assertNotEqual(app.details.get('new2', {}).get('last_user'), 'чужое')
+
+    async def test_enter_on_session_open_in_another_terminal_warns(self):
+        self.takt.live = [{'sessionId': 'new2', 'id': None, 'kind': 'interactive', 'pid': 7, 'name': 'claude-3',
+                           'state': 'busy', 'blocked': False}]
+        app = c_tui.Pult(self.rows)
+        async with app.run_test(size=(140, 45)) as pilot:
+            await self.open_takt(app, pilot)
+            app.query_one('#sessions').focus()
+            await pilot.press('enter')
+            await pilot.pause()
+            self.assertIsNone(app.return_value)
+            self.assertTrue(any('другом терминале' in str(n.message) for n in app._notifications))
 
     async def test_escape_from_sessions_goes_back_to_tree(self):
         app = c_tui.Pult(self.rows)
