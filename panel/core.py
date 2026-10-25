@@ -144,24 +144,182 @@ def add_stats(rows):
         files = glob.glob(os.path.join(PROJECTS, encode(r.path), '*.jsonl'))
         r.sessions = len(files)
         r.last = max((os.path.getmtime(f) for f in files), default=0.0)
-        r.live = [dict(s, blocked=s.get('sessionId') in blocked) for s in live.get(r.path, [])]
+        r.live = [dict(s, blocked=s.get('sessionId') in blocked or s.get('state') == 'blocked')
+                  for s in live.get(r.path, [])]
     return rows
 
 
 def session_names(path, n=6):
-    """Имена последних сессий папки, свежие первыми (из хвоста стенограмм)."""
+    """Имена последних сессий папки, свежие первыми; у безымянной — начало первого запроса."""
     names = []
-    files = sorted(glob.glob(os.path.join(PROJECTS, encode(path), '*.jsonl')), key=os.path.getmtime, reverse=True)
-    for f in files[:n]:
+    for f in folder_sessions(path, n):
         try:
-            with open(f, 'rb') as fh:
-                fh.seek(max(0, os.path.getsize(f) - 4096))
-                tail = fh.read().decode('utf-8', 'ignore')
+            b = session_brief(f)
         except OSError:
             continue
-        m = re.findall(r'"customTitle":"((?:[^"\\]|\\.)*)"', tail) or re.findall(r'"agentName":"((?:[^"\\]|\\.)*)"', tail)
-        names.append(m[-1] if m else 'без имени')
+        names.append(b['title'] or _cut(b['first'].split('\n')[0], 50) or 'без имени')
     return names
+
+
+# ---------- что внутри сессии ----------
+# Стенограммы бывают по 90 МБ: название и первый запрос берём из начала и хвоста файла,
+# последний обмен — из хвоста, «где работала» — проходом по сырым байтам. Всё кэшируется по mtime.
+
+HEAD, TAIL, HEAD_MAX, TAIL_MAX = 256 * 1024, 64 * 1024, 2 * 1024 * 1024, 8 * 1024 * 1024
+SKIP_PROMPT = ('<command-', '<local-command', '<task-notification', '<system-reminder', '<bash-',
+               '<user-prompt-submit-hook', 'Caveat:', '[Request interrupted', 'This session is being continued')
+_TITLE = re.compile(rb'"customTitle":\s*"((?:[^"\\]|\\.)*)"')
+_AGENT = re.compile(rb'"agentName":\s*"((?:[^"\\]|\\.)*)"')
+_TS = re.compile(rb'"timestamp":\s*"([^"]+)"')
+_CWD = re.compile(rb'"cwd":\s*"((?:[^"\\]|\\.)*)"')
+_USER = re.compile(rb'"type":\s*"user"')
+_cache = {}
+
+
+def user_text(d):
+    """Реплика человека из строки стенограммы; служебное (команды, уведомления, сводки) — ''."""
+    if d.get('type') != 'user' or d.get('isMeta') or d.get('isSidechain'):
+        return ''
+    body = (d.get('message') or {}).get('content')
+    if isinstance(body, list):
+        body = '\n'.join(p.get('text', '') for p in body if isinstance(p, dict) and p.get('type') == 'text')
+    if not isinstance(body, str):
+        return ''
+    t = re.sub(r'</?pasted_content[^>]*>', '', body).strip()
+    return '' if not t or t.startswith(SKIP_PROMPT) else t
+
+
+def _answer_text(d):
+    if d.get('type') != 'assistant' or d.get('isSidechain'):
+        return ''
+    body = (d.get('message') or {}).get('content') or []
+    return '\n'.join(p.get('text', '') for p in body if isinstance(p, dict) and p.get('type') == 'text').strip()
+
+
+def _read(f, start, size):
+    with open(f, 'rb') as fh:
+        fh.seek(start)
+        return fh.read(size)
+
+
+def _records(blob, cut_first, only=None):
+    """Строки JSONL из окна файла; обрезанные края окна пропускаются. only — сырой фильтр до разбора."""
+    lines = blob.split(b'\n')
+    if cut_first:
+        lines = lines[1:]
+    for line in lines:
+        if not line.strip() or (only is not None and not only.search(line)):
+            continue
+        try:
+            yield json.loads(line)
+        except ValueError:
+            continue
+
+
+def _unq(raw):
+    try:
+        return json.loads(b'"' + raw + b'"')
+    except ValueError:
+        return raw.decode('utf-8', 'ignore')
+
+
+def _epoch(iso):
+    import datetime
+    try:
+        return datetime.datetime.fromisoformat(iso.replace('Z', '+00:00')).timestamp()
+    except ValueError:
+        return 0.0
+
+
+def _cached(kind, f, build):
+    st = os.stat(f)
+    key = (kind, f, st.st_mtime, st.st_size)
+    if key not in _cache:
+        _cache[key] = build(st.st_size)
+    return _cache[key]
+
+
+def folder_sessions(path, limit=None, projects=None):
+    """Файлы стенограмм сессий, запущенных из этой папки, свежие первыми."""
+    files = glob.glob(os.path.join(projects or PROJECTS, encode(path), '*.jsonl'))
+    files.sort(key=os.path.getmtime, reverse=True)
+    return files[:limit] if limit else files
+
+
+def session_brief(f):
+    """{id, file, title, first, started, last}: название, первый запрос, начало и последняя запись."""
+    def build(size):
+        head = _read(f, 0, HEAD)
+        tail = _read(f, size - TAIL, TAIL) if size > HEAD + TAIL else b''
+        titles = _TITLE.findall(tail) or _TITLE.findall(head) or _AGENT.findall(tail) or _AGENT.findall(head)
+        first = ''
+        for blob in (head, _read(f, 0, HEAD_MAX) if size > HEAD else b''):
+            first = next((t for t in map(user_text, _records(blob, False, _USER)) if t), '')
+            if first:
+                break
+        ts = _TS.search(head)
+        return {'id': os.path.basename(f)[:-6], 'file': f, 'title': _unq(titles[-1]) if titles else '',
+                'first': first, 'started': _epoch(ts.group(1).decode()) if ts else 0.0,
+                'last': os.path.getmtime(f)}
+    return _cached('brief', f, build)
+
+
+def _place(cwd, root):
+    if cwd == root:
+        return '~/claude'
+    if cwd.startswith(root + '/'):
+        return '/'.join(cwd[len(root) + 1:].split('/')[:2])
+    return cwd.replace(H, '~')
+
+
+def session_detail(f, root=ROOT):
+    """{last_user, last_answer, error, branch, places}: чем сессия закончилась и в каких проектах шла работа."""
+    def build(size):
+        span, last_user, last_answer, branch, error, failure = 256 * 1024, '', '', '', '', ''
+        while True:
+            recs = list(_records(_read(f, max(0, size - span), span), size > span))
+            iu = ia = ie = -1
+            for i, d in enumerate(recs):
+                t = user_text(d)
+                if t:
+                    iu, last_user = i, t
+                a = _answer_text(d)
+                if a.startswith(('API Error', 'Please run /login')) or 'API Error:' in a[:120]:
+                    ie, failure = i, a
+                elif a:
+                    ia, last_answer = i, a
+                branch = d.get('gitBranch') or branch
+            if last_user or span >= size or span >= TAIL_MAX:
+                break
+            span *= 4
+        if ie > max(ia, iu):
+            error = 'ошибка входа' if any(k in failure for k in ('/login', '401', '403', 'OAuth')) else 'ошибка API'
+        elif iu > ia:
+            error = 'без ответа'
+        counts = {}
+        for raw in _CWD.findall(_read(f, 0, size)):
+            p = _place(_unq(raw), root)
+            counts[p] = counts.get(p, 0) + 1
+        total = sum(counts.values()) or 1
+        places = sorted(counts.items(), key=lambda kv: -kv[1])
+        return {'last_user': last_user, 'last_answer': last_answer, 'error': error, 'branch': branch,
+                'places': [(p, round(100 * n / total)) for p, n in places[:3] if 100 * n / total >= 3]}
+    return _cached('detail', f, build)
+
+
+def when(ts, now=None):
+    """«сегодня 09:05», «вчера 21:26», «03.10 16:18»."""
+    if not ts:
+        return ''
+    now = now or time.time()
+    lt = time.localtime(ts)
+    if lt[:3] == time.localtime(now)[:3]:
+        day = 'сегодня'
+    elif lt[:3] == time.localtime(now - 86400)[:3]:
+        day = 'вчера'
+    else:
+        day = time.strftime('%d.%m', lt)
+    return f'{day} {time.strftime("%H:%M", lt)}'
 
 
 def _ago(ts):
@@ -184,7 +342,7 @@ def _status(r):
         return ''
     if any(s['blocked'] for s in r.live):
         return 'ЖДЁТ'
-    if any(s.get('state') == 'busy' for s in r.live):
+    if any(s.get('state') in ('busy', 'working') for s in r.live):
         return 'работает'
     return 'живая'
 
@@ -211,7 +369,7 @@ def place_lines(rows):
         if r.depth == 0:
             vis = f'{BOLD}{_cut("~/claude", 26):<26}{RST} {DIM}{_cut(r.what, 40):<40}{RST} {_sess(r):<20} {_status_c(r)}'
         elif r.depth == 1:
-            vis = f'{SEG}{BOLD}{_cut(r.label + "/", 26):<26}{RST} {DIM}{_cut(r.what, 40)}{RST}'
+            vis = f'{SEG}{BOLD}{_cut(r.label + "/", 26):<26}{RST} {DIM}{_cut(r.what, 40):<40}{RST} {_sess(r):<20} {_status_c(r)}'
         else:
             dim = DIM if not (r.what or r.sessions) else ''
             vis = f'  {dim}{_cut(r.label, 24):<24}{RST} {_cut(r.what, 40):<40} {_sess(r):<20} {_status_c(r)}'
@@ -291,7 +449,7 @@ def launch(row, action, name=''):
     os.chdir(row.path)
     if action == 'resume':
         args = ['claude', '-r']
-    elif action.startswith('attach:'):
+    elif action.startswith(('attach:', 'session:')):
         args = ['claude', '-r', action.split(':', 1)[1]]
     elif action == 'new':
         args = ['claude', '-n', name or session_name(row, '')]
