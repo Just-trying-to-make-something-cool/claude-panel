@@ -150,6 +150,14 @@ class Live(unittest.TestCase):
         self.assertEqual(live['/c'][0]['name'], 'takt · оценка')
         self.assertEqual(c._status(c.Row('/c', 2, 'c', live=live['/c'])), 'работает')
 
+    def test_interactive_listed_first_still_attaches_to_background(self):
+        agents = [{'cwd': '/c', 'sessionId': 'x', 'name': 'claude-41', 'status': 'busy', 'kind': 'interactive', 'pid': 3},
+                  {'cwd': '/c', 'sessionId': 'x', 'id': 'x1', 'name': 'root · линкедин', 'state': 'blocked', 'kind': 'background'}]
+        live = c.group_live(agents)
+        self.assertEqual(len(live['/c']), 1)
+        self.assertEqual(c.open_action('x', live['/c']), 'bg:x1')
+        self.assertEqual(live['/c'][0]['name'], 'root · линкедин')
+
     def test_blocked_from_job_state(self):
         live = c.group_live([{'cwd': '/c', 'sessionId': 'q', 'name': 'n', 'state': 'working'}], blocked={'q'})
         self.assertTrue(live['/c'][0]['blocked'])
@@ -160,10 +168,26 @@ class OpenSession(unittest.TestCase):
         self.assertEqual(c.open_action('a4ff9cb7-e4fe', live), 'bg:a4ff9cb7')
 
     def test_interactive_or_finished_session_is_resumed(self):
-        live = [{'sessionId': 'x', 'id': None, 'kind': 'interactive', 'blocked': False}]
+        live = [{'sessionId': 'x', 'id': None, 'kind': 'background', 'blocked': False}]   # фоновая без id
         self.assertEqual(c.open_action('x', live), 'session:x')
         self.assertEqual(c.open_action('y', live), 'session:y')
         self.assertEqual(c.open_action('x', live, 'attach'), 'attach:x')
+
+    def test_session_open_in_another_terminal_is_not_reopened(self):
+        live = [{'sessionId': 'x', 'id': None, 'kind': 'interactive', 'pid': 3280, 'blocked': False}]
+        self.assertEqual(c.open_action('x', live), 'busy:x')
+
+    def test_launch_busy_does_not_start_claude(self):
+        import contextlib, io
+        err = io.StringIO()
+        os.environ['C_DRY'] = '1'          # страховка: без неё ошибка в launch выполнила бы exec claude
+        try:
+            with contextlib.redirect_stderr(err):
+                c.launch(c.Row(tempfile.mkdtemp(), 2, 'p'), 'busy:x')
+        finally:
+            os.environ.pop('C_DRY')
+        self.assertIn('уже открыта', err.getvalue())
+        self.assertNotIn('claude -', err.getvalue())
 
     def test_launch_bg_runs_claude_attach(self):
         import contextlib, io

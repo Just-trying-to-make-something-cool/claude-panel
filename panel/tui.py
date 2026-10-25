@@ -8,7 +8,7 @@
 Клавиши: ↑↓ по дереву · Enter продолжить (на сегменте — раскрыть) · Tab к списку сессий, Enter открыть
 выбранную · n новая · r все сессии · Esc назад к дереву, ещё раз — выход · q выход. Мышь работает.
 """
-import os, sys, time
+import os, re, sys, time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from panel import core as c  # noqa: E402
@@ -21,7 +21,6 @@ from textual import work  # noqa: E402
 from textual.app import App, ComposeResult  # noqa: E402
 from textual.binding import Binding  # noqa: E402
 from textual.containers import Horizontal, Vertical  # noqa: E402
-from textual.markup import escape  # noqa: E402
 from textual.widgets import Button, Footer, Input, OptionList, Static, Tree  # noqa: E402
 from textual.widgets.option_list import Option  # noqa: E402
 from textual.worker import get_current_worker  # noqa: E402
@@ -33,8 +32,14 @@ SEG_ICONS = {'kvant-lab': '🧪', 'clients': '🤝', 'infra': '🧰', 'personal'
 DOT = {'ЖДЁТ': '[bold yellow]●[/]', 'работает': '[blue]●[/]', 'живая': '[green]●[/]', '': ''}
 THEME = os.environ.get('C_THEME', 'catppuccin-mocha')
 LIST_LIMIT = 30                     # в папках автоворонки по 1300 сессий: показываем свежие
-BROKEN = ('ошибка входа', 'ошибка API')
+BROKEN = ('ошибка входа', 'ошибка API', 'лимит')
 STATES = {'working': 'работает', 'busy': 'работает', 'idle': 'свободна'}
+
+
+def esc(s):
+    """Текст с диска для разметки Textual: экранируется каждая «[». Штатный escape пропускает
+    незакрытые, и обрезанное «…скажи [Im…» роняло окно с MarkupError."""
+    return re.sub(r'\\+(?=\[)', '', str(s)).rstrip('\\').replace('[', '\\[')
 
 
 def plural(n, one, few, many):
@@ -63,9 +68,9 @@ def tree_label(r):
     if r.depth == 0:
         name = '[bold]~/claude[/]'
     elif r.depth == 1:
-        name = f'{SEG_ICONS.get(r.label, "•")} [bold]{escape(nice_name(r))}[/]'
+        name = f'{SEG_ICONS.get(r.label, "•")} [bold]{esc(nice_name(r))}[/]'
     else:
-        name = escape(r.label)
+        name = esc(r.label)
         if not (r.what or r.sessions) and r.depth == 2:
             name = f'[dim]{name}[/]'
     tail = ''
@@ -83,12 +88,12 @@ def greeting(rows, now=None):
     live = [s for r in rows for s in r.live]
     if live:
         wait = sum(1 for s in live if s.get('blocked'))
-        parts.append(f'живых сессий: {len(live)}' + (f', [bold yellow]ждут ответа: {wait}[/]' if wait else ''))
+        parts.append(f'живых сессий в ~/claude: {len(live)}' + (f', [bold yellow]ждут ответа: {wait}[/]' if wait else ''))
     last = max(rows, key=lambda r: r.last)
     if last.last:
         names = c.session_names(last.path, 1)
-        title = f'«{escape(names[0])}» ' if names else ''
-        parts.append(f'последняя работа: {title}в {escape(last.path.replace(c.H, "~"))}, {c.when(last.last)}')
+        title = f'«{esc(names[0])}» ' if names else ''
+        parts.append(f'последняя работа: {title}в {esc(last.path.replace(c.H, "~"))}, {c.when(last.last)}')
     return '   '.join(parts)
 
 
@@ -104,10 +109,10 @@ def session_line(b, d=None, here='', live=None):
         mark = '[bold yellow]●[/]' if live[b['id']] else '[green]●[/]'
     else:
         mark = '[yellow]⚠[/]' if d and d['error'] in BROKEN else ' '
-    line = f'{mark} {escape(title)}  [dim]{c.when(b["last"])}[/]'
+    line = f'{mark} {esc(title)}  [dim]{c.when(b["last"])}[/]'
     away = [p for p, n in (d or {}).get('places', []) if p != here and n >= 20]
     if away:
-        line += f'  [dim italic]→ {escape(away[0])}[/]'
+        line += f'  [dim italic]→ {esc(away[0])}[/]'
     return line
 
 
@@ -130,10 +135,16 @@ def detail_view(b, d, live=None):
     else:
         if d['last_user'] and _line(d['last_user'], 220) != _line(b['first'], 220):
             add('последний запрос', rich_escape(_line(d['last_user'], 220)))
-        if live:
-            add('сейчас', '[bold yellow]● ждёт вашего ответа[/]' if live.get('blocked') else '[green]● идёт прямо сейчас[/]')
+        if live and live.get('blocked'):
+            add('сейчас', '[bold yellow]● ждёт вашего ответа[/]')
+        elif live and live.get('kind') == 'interactive':
+            add('сейчас', '[green]● открыта в другом терминале[/] — переключитесь туда')
+        elif live:
+            add('сейчас', '[green]● идёт прямо сейчас[/]')
         elif d['error'] == 'ошибка входа':
             add('чем кончилась', '[yellow]⚠ оборвалась на ошибке входа[/] — откройте, выполните /login и напишите «продолжи»')
+        elif d['error'] == 'лимит':
+            add('чем кончилась', '[yellow]⚠ оборвалась на лимите[/] — когда лимит обновится, откройте и напишите «продолжи»')
         elif d['error'] == 'ошибка API':
             add('чем кончилась', '[yellow]⚠ оборвалась на ошибке API[/] — откройте и напишите «продолжи»')
         elif d['error'] == 'без ответа':
@@ -202,6 +213,7 @@ class Pult(App):
         yield Static(greeting(self.rows), id='hello')
         with Horizontal(id='body'):
             tree = Tree(tree_label(self.rows[0]), data=self.rows[0], id='tree')
+            tree.auto_expand = False     # раскрытие решает on_tree_node_selected: Enter на корне продолжает
             tree.root.expand()
             by_path = {self.rows[0].path: tree.root}
             for r in self.rows[1:]:
@@ -250,11 +262,11 @@ class Pult(App):
         self.current = r
         path = r.path.replace(c.H, '~')
         card = self.query_one('#card')
-        card.border_title = f' {escape(nice_name(r))} '
-        card.border_subtitle = f'в открытой сессии: /cd {escape(path)}'
-        self.query_one('#title', Static).update(escape(path))
-        self.query_one('#what', Static).update(escape(c._cut(r.what, 180 if r.depth < 2 else 300)) if r.what else '')
-        self.query_one('#meta', Static).update(f'где живёт: {escape(r.where)}' if r.where else '')
+        card.border_title = f' {esc(nice_name(r))} '
+        card.border_subtitle = f'в открытой сессии: /cd {esc(path)}'
+        self.query_one('#title', Static).update(esc(path))
+        self.query_one('#what', Static).update(esc(c._cut(r.what, 180 if r.depth < 2 else 300)) if r.what else '')
+        self.query_one('#meta', Static).update(f'где живёт: {esc(r.where)}' if r.where else '')
         btn = self.query_one('#continue', Button)
         btn.label = '▶ Продолжить' if r.sessions else '▶ Начать здесь'
         btn.display = r.depth != 1 or r.sessions > 0
@@ -263,12 +275,13 @@ class Pult(App):
         live.clear_options()
         seen = set()
         for s in r.live:
-            if s.get('sessionId') in seen:      # страховка: повтор id валит OptionList
+            sid = s.get('sessionId')
+            if sid and sid in seen:             # страховка: повтор id валит OptionList
                 continue
-            seen.add(s.get('sessionId'))
+            seen.add(sid)
             tag = 'ждёт ответа' if s['blocked'] else STATES.get(s.get('state'), s.get('state') or '')
-            live.add_option(Option(f'{DOT["ЖДЁТ" if s["blocked"] else "живая"]} {escape(s.get("name") or "")}  [dim]{tag}[/]',
-                                   id=c.open_action(s.get('sessionId'), r.live, 'attach')))
+            live.add_option(Option(f'{DOT["ЖДЁТ" if s["blocked"] else "живая"]} {esc(s.get("name") or "")}  [dim]{tag}[/]',
+                                   id=c.open_action(sid, r.live, 'attach') if sid else None))
         self.query_one('#live_h').display = bool(r.live)
         live.display = bool(r.live)
         if r.sessions:
@@ -285,6 +298,8 @@ class Pult(App):
         self.briefs, self.details = {}, {}
         if r.sessions:
             self.load_sessions(r)
+        else:
+            self.workers.cancel_group(self, 'sessions')
 
     def _here(self, r):
         return c._place(r.path, c.ROOT)
@@ -293,7 +308,7 @@ class Pult(App):
         try:
             self.call_from_thread(fn, *args)
             return True
-        except Exception:           # окно уже закрыто
+        except RuntimeError:        # окно уже закрыто («App is not running»)
             return False
 
     @work(thread=True, exclusive=True, group='sessions')
@@ -364,8 +379,13 @@ class Pult(App):
             self.show(ev.node.data)
 
     def on_tree_node_selected(self, ev: Tree.NodeSelected):
-        if ev.node.data is not None and ev.node.data.depth >= 2:
+        r = ev.node.data
+        if r is None:
+            return
+        if r.depth >= 2 or (r.depth == 0 and r.sessions):
             self.finish('continue')
+        else:
+            ev.node.toggle()            # сегмент: Enter раскрывает, продолжает кнопка
 
     def on_option_list_option_highlighted(self, ev: OptionList.OptionHighlighted):
         if ev.option_list.id == 'sessions' and ev.option.id:
@@ -375,7 +395,11 @@ class Pult(App):
         if not ev.option.id:
             return
         sessions = ev.option_list.id == 'sessions'
-        self.finish(c.open_action(ev.option.id, self.current.live) if sessions else ev.option.id)
+        action = c.open_action(ev.option.id, self.current.live) if sessions else ev.option.id
+        if action.startswith('busy:'):
+            self.notify('Эта сессия уже открыта в другом терминале — переключитесь туда.', severity='warning')
+            return
+        self.finish(action)
 
     # ---------- действия ----------
     def finish(self, action, name=''):
@@ -393,7 +417,7 @@ class Pult(App):
         box = self.query_one('#name_box')
         box.add_class('show')
         base = c.session_name(self.current, '')
-        self.query_one('#name_label', Static).update(f'Имя новой сессии: [bold]{escape(base)} · …[/]   Enter — запустить, Esc — отмена')
+        self.query_one('#name_label', Static).update(f'Имя новой сессии: [bold]{esc(base)} · …[/]   Enter — запустить, Esc — отмена')
         inp = self.query_one('#name', Input)
         inp.value = ''
         inp.focus()
