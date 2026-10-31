@@ -11,12 +11,17 @@ c --preview PATH  правая панель (служебное)
 
 Список строится из дерева ~/claude без конфига; описания из таблиц «| папка | что | где |»
 в CLAUDE.md родителя. Внутри уже открытой сессии тот же переезд делает /cd <путь>.
+
+Claude запускается внутри zellij (если есть ~/.local/bin/zellij): тогда в окно может печатать пульт агентов
+с телефона. Снаружи всё как раньше. C_PLAIN=1 c — запуск без zellij.
 """
-import dataclasses, glob, json, os, re, subprocess, sys, threading, time
+import dataclasses, glob, json, os, re, shutil, signal, subprocess, sys, threading, time
 
 H = os.path.expanduser('~')
 ROOT = os.environ.get('C_ROOT', H + '/claude')
 PROJECTS = H + '/.claude/projects'
+ZELLIJ = os.environ.get('C_ZELLIJ', H + '/.local/bin/zellij')
+ZDIR = H + '/.cache/claude-panel'   # описания окон zellij на время запуска
 SKIP = {'archive', 'node_modules'}
 AGENT_WT = re.compile(r'^agent-[0-9a-f]{12,}$')   # служебные копии субагентов
 
@@ -554,7 +559,48 @@ def launch(row, action, name=''):
     print(f'{DIM}→ {row.path.replace(H, "~")}  claude {" ".join(args[1:])}{RST}', file=sys.stderr)
     if os.environ.get('C_DRY'):
         return
+    if os.access(ZELLIJ, os.X_OK) and not os.environ.get('C_PLAIN') and not os.environ.get('ZELLIJ'):
+        return in_zellij(row, args)
     os.execvp('claude', args)
+
+
+def in_zellij(row, args):
+    """Claude в окне zellij: в такое окно может печатать пульт агентов с телефона (agentic-os, вкладка «Окна»).
+    Снаружи всё как раньше: /exit закрывает окно, закрытый Terminal завершает Claude. Сам zellij на закрытие
+    окна (SIGHUP) оставляет сессию в фоне — её закрываем здесь. C_PLAIN=1 c — запуск без zellij."""
+    env = dict(os.environ, ZELLIJ_SOCKET_DIR=f'/tmp/zellij-{os.getuid()}')   # там окна ищет пульт
+    base = re.sub(r'[\x00-\x1f/\\"|]', ' ', session_name(row, '')).strip()[:24] or 'claude'  # сокет macOS ≤ 104 байт
+    try:
+        have = set(subprocess.run([ZELLIJ, 'list-sessions', '-s', '-n'], env=env, capture_output=True,
+                                  text=True, timeout=5).stdout.split('\n'))
+    except Exception:
+        have = set()
+    name, n = base, 1
+    while name in have:
+        n += 1
+        name = f'{base} {n}'
+    os.makedirs(ZDIR, exist_ok=True)
+    lay = os.path.join(ZDIR, f'{os.getpid()}.kdl')
+    q = lambda v: json.dumps(v, ensure_ascii=False)
+    with open(lay, 'w') as f:   # zellij 0.45: при закрытии по /exit окно исчезает только с close_on_exit из описания
+        f.write('layout {\n    cwd %s\n    pane command=%s close_on_exit=true {\n        args %s\n    }\n}\n'
+                % (q(row.path), q(shutil.which('claude') or 'claude'), ' '.join(q(a) for a in args[1:])))
+
+    def close(*_):
+        subprocess.run([ZELLIJ, 'kill-session', name], env=env, capture_output=True, timeout=10)
+        done()
+        os._exit(0)
+
+    def done():
+        try:
+            os.remove(lay)
+        except OSError:
+            pass
+    signal.signal(signal.SIGHUP, close)
+    r = subprocess.run([ZELLIJ, '-s', name, '-n', lay], env=env)
+    done()
+    if r.returncode < 0:   # окно убито сигналом: сессию в фоне не оставляем
+        close()
 
 
 def ask_name(row):
