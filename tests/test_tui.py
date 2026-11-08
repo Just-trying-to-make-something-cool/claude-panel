@@ -1,26 +1,79 @@
 """Безголовые тесты окна: .venv/bin/python -m unittest discover tests"""
-import io, json, os, sys, tempfile, time, unittest
-
-from rich.console import Console
+import json, os, sys, tempfile, time, unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from panel import core as c, tui as c_tui  # noqa: E402
 
+DAY = 86400
 
-def make_tree():
-    root = tempfile.mkdtemp()
-    mk = lambda *p: os.makedirs(os.path.join(root, *p), exist_ok=True)
-    mk('kvant-lab', 'takt'); mk('kvant-lab', 'autovoronka', '.claude', 'worktrees', 'prod'); mk('clients', 'sova')
-    with open(os.path.join(root, 'kvant-lab', 'CLAUDE.md'), 'w') as fh:
-        fh.write('| папка | что | где |\n|---|---|---|\n| `takt/` | таск-менеджер | VPS |\n')
-    rows = c.discover(root)
-    for r in rows:
-        if r.label == 'autovoronka':
-            r.sessions, r.last = 3, 1.0
-            r.live = [{'sessionId': 'abc', 'name': 'rop', 'state': 'busy', 'blocked': False}]
-        if r.label in ('autovoronka', 'takt'):
-            r.active = time.time()          # недавняя работа: проект сверху сегмента, а не в «давно не открывались»
-    return root, rows
+
+def jsonl(path, lines, age_days):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, 'w', encoding='utf-8') as fh:
+        for x in lines:
+            fh.write(json.dumps(x, ensure_ascii=False) + '\n')
+    t = time.time() - age_days * DAY
+    os.utime(path, (t, t))
+    return os.path.basename(path)[:-6]
+
+
+def say(text, cwd, robot=False):
+    return {'type': 'user', 'message': {'role': 'user', 'content': text}, 'cwd': cwd,
+            'timestamp': '2026-11-08T10:00:00.000Z', 'entrypoint': 'sdk-cli' if robot else 'cli'}
+
+
+def reply(text, cwd):
+    return {'type': 'assistant', 'message': {'role': 'assistant', 'content': [{'type': 'text', 'text': text}]},
+            'cwd': cwd, 'timestamp': '2026-11-08T10:01:00.000Z'}
+
+
+class World:
+    """~/claude во временной папке и стенограммы к нему: сессия про лиды из KVANT LAB, работавшая в kvant-radar,
+    сессия в takt, сессия в автоворонке без названия, прогон робота из корня."""
+
+    def __init__(self, extra=()):
+        self.root, self.projects = tempfile.mkdtemp(), tempfile.mkdtemp()
+        for p in ('kvant-lab/takt', 'kvant-lab/kvant-radar', 'kvant-lab/autovoronka/.claude/worktrees/prod', 'clients/sova'):
+            os.makedirs(os.path.join(self.root, p))
+        with open(os.path.join(self.root, 'kvant-lab', 'CLAUDE.md'), 'w') as fh:
+            fh.write('| папка | что | где |\n|---|---|---|\n| `takt/` | таск-менеджер | VPS |\n'
+                     '| `kvant-radar/` | агент горячих лидов | дизайн |\n')
+        p = lambda folder: os.path.join(self.projects, c.encode(os.path.join(self.root, folder) if folder else self.root))
+        radar = os.path.join(self.root, 'kvant-lab', 'kvant-radar')
+        self.leads = jsonl(p('kvant-lab') + '/leads.jsonl',
+                           [say('оцени письма', self.root + '/kvant-lab'), {'type': 'custom-title', 'customTitle': 'kvant-lab · горячие лиды личка'}]
+                           + [reply('ок', radar)] * 5, 0.1)
+        self.takt = jsonl(p('kvant-lab/takt') + '/takt.jsonl',
+                          [say('план на неделю', self.root + '/kvant-lab/takt'), {'type': 'custom-title', 'customTitle': 'takt · бизнес'}], 1)
+        self.rop = jsonl(p('kvant-lab/autovoronka') + '/rop.jsonl',
+                         [say('почему РОП пишет про проблему с лидами', self.root + '/kvant-lab/autovoronka')], 3)
+        self.robot = jsonl(p('') + '/robot.jsonl', [say('проверь сайты', self.root, robot=True)], 0)
+        for folder, name, lines in extra:
+            jsonl(p(folder) + f'/{name}.jsonl', lines, 2)
+        self.saved, c.PROJECTS = c.PROJECTS, self.projects
+        self.rows = c.discover(self.root)
+        for r in self.rows:
+            stamps = [c._mtime(f) for f in c.folder_sessions(r.path)]
+            r.sessions, r.last = len(stamps), max(stamps, default=0.0)
+        c.add_activity(self.rows, projects=self.projects, cache=os.path.join(tempfile.mkdtemp(), 'places.json'))
+
+    def row(self, label):
+        return next(r for r in self.rows if r.label == label)
+
+    def close(self):
+        c.PROJECTS = self.saved
+
+
+async def ready(app, pilot):
+    await pilot.pause()
+    await app.workers.wait_for_complete()
+    await pilot.pause()
+
+
+def shown(app):
+    """Строки списка сессий как текст: (id опции, текст)."""
+    lst = app.query_one('#list')
+    return [(o.id, str(o.prompt) if isinstance(o.prompt, str) else c_tui.plain(o.prompt)) for o in lst.options]
 
 
 class Markup(unittest.TestCase):
@@ -33,9 +86,257 @@ class Markup(unittest.TestCase):
 
 class Order(unittest.TestCase):
     def test_kvant_lab_first_then_clients(self):
-        root, rows = make_tree()
-        segs = [r.label for r in c_tui.ordered(rows) if r.depth == 1]
+        w = World()
+        w.close()
+        segs = [r.label for r in c_tui.ordered(w.rows) if r.depth == 1]
         self.assertEqual(segs, ['kvant-lab', 'clients'])
+
+
+class Sessions(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.w = World()
+
+    def tearDown(self):
+        self.w.close()
+
+    async def test_opens_on_sessions_with_search_focused_robots_hidden(self):
+        app = c_tui.Pult(self.w.rows)
+        async with app.run_test() as pilot:
+            await ready(app, pilot)
+            self.assertEqual(app.query_one('#switch').current, 'sessions')
+            self.assertEqual(app.focused.id, 'q')
+            texts = [t for _, t in shown(app)]
+            self.assertEqual(len(texts), 3)
+            self.assertIn('горячие лиды личка', texts[0])
+            self.assertIn('бизнес', texts[1])
+            self.assertIn('почему РОП', texts[2])
+            self.assertFalse(any('проверь сайты' in t for t in texts))
+
+    async def test_typing_narrows_and_offers_folder(self):
+        app = c_tui.Pult(self.w.rows)
+        async with app.run_test() as pilot:
+            await ready(app, pilot)
+            await pilot.press(*'лид')
+            await pilot.pause()
+            texts = [t for _, t in shown(app)]
+            self.assertIn('горячие лиды личка', texts[0])
+            self.assertIn('почему РОП', texts[1])
+            self.assertIn('Новая сессия в папке', texts[2])
+            self.assertIn('kvant-radar', texts[3])
+            self.assertEqual(len(texts), 4)
+
+    async def test_clearing_query_restores_full_list(self):
+        app = c_tui.Pult(self.w.rows)
+        async with app.run_test() as pilot:
+            await ready(app, pilot)
+            await pilot.press(*'лид', 'backspace', 'backspace', 'backspace')
+            await pilot.pause()
+            self.assertEqual(len(shown(app)), 3)
+            self.assertEqual(app.query_one('#list').highlighted, 0)
+
+    async def test_no_match_says_so_and_enter_does_nothing(self):
+        app = c_tui.Pult(self.w.rows)
+        async with app.run_test() as pilot:
+            await ready(app, pilot)
+            await pilot.press(*'zzz', 'enter')
+            await pilot.pause()
+            self.assertIn('ничего не нашлось', shown(app)[0][1])
+            self.assertIsNone(app.return_value)
+            self.assertTrue(app.is_running)
+
+    async def test_enter_opens_highlighted_from_its_folder(self):
+        app = c_tui.Pult(self.w.rows)
+        async with app.run_test() as pilot:
+            await ready(app, pilot)
+            await pilot.press('enter')
+        row, action, name = app.return_value
+        self.assertEqual((row.label, action), ('kvant-lab', f'session:{self.w.leads}'))
+
+    async def test_down_then_enter_opens_second(self):
+        app = c_tui.Pult(self.w.rows)
+        async with app.run_test() as pilot:
+            await ready(app, pilot)
+            await pilot.press('down', 'enter')
+        row, action, name = app.return_value
+        self.assertEqual((row.label, action), ('takt', f'session:{self.w.takt}'))
+
+    async def test_detail_follows_highlight(self):
+        app = c_tui.Pult(self.w.rows)
+        async with app.run_test() as pilot:
+            await ready(app, pilot)
+            detail = lambda: c_tui.plain(app.query_one('#detail').content)
+            self.assertIn('горячие лиды личка', detail())
+            self.assertIn('оцени письма', detail())
+            await pilot.press('down')
+            await ready(app, pilot)
+            self.assertIn('план на неделю', detail())
+
+    async def test_escape_clears_then_quits(self):
+        app = c_tui.Pult(self.w.rows)
+        async with app.run_test() as pilot:
+            await ready(app, pilot)
+            await pilot.press('x', 'escape')
+            await pilot.pause()
+            self.assertEqual(app.query_one('#q').value, '')
+            self.assertTrue(app.is_running)
+            await pilot.press('escape')
+            await pilot.pause()
+        self.assertIsNone(app.return_value)
+
+    async def test_letters_go_to_search_not_to_commands(self):
+        app = c_tui.Pult(self.w.rows)
+        async with app.run_test() as pilot:
+            await ready(app, pilot)
+            await pilot.press(*'qnrc')
+            await pilot.pause()
+            self.assertEqual(app.query_one('#q').value, 'qnrc')
+            self.assertTrue(app.is_running)
+
+    async def test_live_background_session_attaches(self):
+        self.w.row('takt').live = [{'sessionId': self.w.takt, 'kind': 'background', 'id': 'a4ff9cb7', 'blocked': False}]
+        app = c_tui.Pult(self.w.rows)
+        async with app.run_test() as pilot:
+            await ready(app, pilot)
+            await pilot.press('down', 'enter')
+        self.assertEqual(app.return_value[1], 'bg:a4ff9cb7')
+
+    async def test_session_open_in_other_terminal_warns(self):
+        self.w.row('kvant-lab').live = [{'sessionId': self.w.leads, 'kind': 'interactive', 'blocked': False}]
+        app = c_tui.Pult(self.w.rows)
+        async with app.run_test() as pilot:
+            await ready(app, pilot)
+            await pilot.press('enter')
+            await pilot.pause()
+            self.assertTrue(app.is_running)
+        self.assertIsNone(app.return_value)
+
+    async def test_waiting_session_is_on_top_and_marked(self):
+        self.w.row('autovoronka').live = [{'sessionId': self.w.rop, 'kind': 'background', 'id': 'b1', 'blocked': True}]
+        app = c_tui.Pult(self.w.rows)
+        async with app.run_test() as pilot:
+            await ready(app, pilot)
+            first = shown(app)[0][1]
+            self.assertIn('почему РОП', first)
+            self.assertIn('ждёт ответа', first)
+
+    async def test_enter_on_folder_asks_name_then_starts_new(self):
+        app = c_tui.Pult(self.w.rows)
+        async with app.run_test() as pilot:
+            await ready(app, pilot)
+            await pilot.press(*'лид', 'down', 'down', 'enter')
+            await pilot.pause()
+            self.assertTrue(app.query_one('#name_box').display)
+            self.assertEqual(app.focused.id, 'name')
+            await pilot.press(*'карточки', 'enter')
+        row, action, name = app.return_value
+        self.assertEqual((row.label, action, name), ('kvant-radar', 'new', 'kvant-radar · карточки'))
+
+
+class Brackets(unittest.IsolatedAsyncioTestCase):
+    async def test_bracket_in_names_does_not_crash(self):
+        w = World(extra=[('kvant-lab/takt', 'br', [say('скажи [Im', '/x'), {'type': 'custom-title', 'customTitle': 'a [b'}])])
+        try:
+            app = c_tui.Pult(w.rows)
+            async with app.run_test() as pilot:
+                await ready(app, pilot)
+                await pilot.press('down', 'down')
+                await ready(app, pilot)
+                self.assertTrue(any('a [b' in t for _, t in shown(app)))
+        finally:
+            w.close()
+
+
+class Folders(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.w = World()
+
+    def tearDown(self):
+        self.w.close()
+
+    async def go(self, app, pilot, label):
+        await ready(app, pilot)
+        await pilot.press('tab')
+        await pilot.pause()
+        tree = app.query_one('#tree')
+        node = next(n for n in c_tui.walk(tree.root) if n.data is not None and n.data.label == label)
+        tree.move_cursor(node)
+        await pilot.pause()
+
+    async def test_tab_switches_modes_and_focus(self):
+        app = c_tui.Pult(self.w.rows)
+        async with app.run_test() as pilot:
+            await ready(app, pilot)
+            await pilot.press('tab')
+            await pilot.pause()
+            self.assertEqual((app.query_one('#switch').current, app.focused.id), ('folders', 'tree'))
+            await pilot.press('tab')
+            await pilot.pause()
+            self.assertEqual((app.query_one('#switch').current, app.focused.id), ('sessions', 'q'))
+
+    async def test_enter_on_project_asks_name_and_starts_new(self):
+        app = c_tui.Pult(self.w.rows)
+        async with app.run_test() as pilot:
+            await self.go(app, pilot, 'takt')
+            await pilot.press('enter')
+            await pilot.pause()
+            self.assertEqual(app.focused.id, 'name')
+            await pilot.press(*'бизнес', 'enter')
+        row, action, name = app.return_value
+        self.assertEqual((row.label, action, name), ('takt', 'new', 'takt · бизнес'))
+
+    async def test_escape_closes_name_box_back_to_tree(self):
+        app = c_tui.Pult(self.w.rows)
+        async with app.run_test() as pilot:
+            await self.go(app, pilot, 'takt')
+            await pilot.press('enter', 'escape')
+            await pilot.pause()
+            self.assertFalse(app.query_one('#name_box').display)
+            self.assertEqual(app.focused.id, 'tree')
+            self.assertTrue(app.is_running)
+
+    async def test_c_continues_last_session_here(self):
+        app = c_tui.Pult(self.w.rows)
+        async with app.run_test() as pilot:
+            await self.go(app, pilot, 'takt')
+            await pilot.press('c')
+        row, action, name = app.return_value
+        self.assertEqual((row.label, action), ('takt', 'continue'))
+
+    async def test_enter_on_segment_toggles(self):
+        app = c_tui.Pult(self.w.rows)
+        async with app.run_test() as pilot:
+            await self.go(app, pilot, 'kvant-lab')
+            node = app.query_one('#tree').cursor_node
+            was = node.is_expanded
+            await pilot.press('enter')
+            await pilot.pause()
+            self.assertNotEqual(node.is_expanded, was)
+            self.assertIsNone(app.return_value)
+
+    async def test_folder_work_shows_guest_session_and_opens_it_from_its_folder(self):
+        app = c_tui.Pult(self.w.rows)
+        async with app.run_test() as pilot:
+            await self.go(app, pilot, 'kvant-radar')
+            work = app.query_one('#work')
+            texts = [c_tui.plain(o.prompt) for o in work.options]
+            self.assertEqual(len(texts), 1)
+            self.assertIn('горячие лиды личка', texts[0])
+            self.assertIn('из KVANT LAB', texts[0])
+            await pilot.press('right')
+            await pilot.pause()
+            self.assertEqual(app.focused.id, 'work')
+            await pilot.press('enter')
+        row, action, name = app.return_value
+        self.assertEqual((row.label, action), ('kvant-lab', f'session:{self.w.leads}'))
+
+    async def test_q_quits_here(self):
+        app = c_tui.Pult(self.w.rows)
+        async with app.run_test() as pilot:
+            await self.go(app, pilot, 'takt')
+            await pilot.press('q')
+            await pilot.pause()
+        self.assertIsNone(app.return_value)
+        self.assertFalse(app.is_running)
 
 
 class Fresh(unittest.IsolatedAsyncioTestCase):
@@ -66,6 +367,8 @@ class Fresh(unittest.IsolatedAsyncioTestCase):
     async def test_enter_on_folded_group_opens_it(self):
         app = c_tui.Pult(self.rows())
         async with app.run_test() as pilot:
+            await ready(app, pilot)
+            await pilot.press('tab')
             tree = app.query_one('#tree')
             old = tree.root.children[0].children[2]
             tree.move_cursor(old)
@@ -75,248 +378,12 @@ class Fresh(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(old.is_expanded)
             self.assertIsNone(app.return_value)
 
-
-class Tui(unittest.IsolatedAsyncioTestCase):
-    async def test_enter_on_project_without_sessions_starts_new(self):
-        root, rows = make_tree()
-        app = c_tui.Pult(rows)
-        async with app.run_test() as pilot:
-            tree = app.query_one('#tree')
-            tree.select_node(next(n for n in tree.root.children[0].children if n.data.label == 'takt'))
-            await pilot.pause()
-        row, action, name = app.return_value
-        self.assertEqual((row.label, action), ('takt', 'continue'))
-
-    async def test_n_opens_name_box_and_enter_submits(self):
-        root, rows = make_tree()
-        app = c_tui.Pult(rows)
-        async with app.run_test() as pilot:
-            tree = app.query_one('#tree')
-            tree.move_cursor(next(n for n in tree.root.children[0].children if n.data.label == 'takt'))
-            await pilot.pause()
-            await pilot.press('n')
-            self.assertTrue(app.query_one('#name_box').has_class('show'))
-            self.assertEqual(app.query_one('#name').value, '')
-            await pilot.press(*'бизнес', 'enter')
-        row, action, name = app.return_value
-        self.assertEqual((row.label, action, name), ('takt', 'new', 'takt · бизнес'))
-
-    async def test_resume_and_live_attach(self):
-        root, rows = make_tree()
-        app = c_tui.Pult(rows)
-        async with app.run_test() as pilot:
-            tree = app.query_one('#tree')
-            tree.move_cursor(next(n for n in tree.root.children[0].children if n.data.label == 'autovoronka'))
-            await pilot.pause()
-            self.assertTrue(app.query_one('#live').display)
-            self.assertTrue(app.query_one('#resume').display)
-            await pilot.press('r')
-        self.assertEqual(app.return_value[1], 'resume')
-
-    async def test_duplicate_live_session_does_not_crash(self):
-        root, rows = make_tree()
-        rows[0].live = [{'sessionId': 'x', 'name': 'root · линкедин', 'state': 'blocked', 'blocked': True},
-                        {'sessionId': 'x', 'name': 'claude-41', 'state': 'busy', 'blocked': True}]
-        app = c_tui.Pult(rows)
-        async with app.run_test() as pilot:
-            await pilot.pause()
-            self.assertEqual(app.query_one('#live').option_count, 1)
-
-    async def test_enter_on_root_with_sessions_continues(self):
-        root, rows = make_tree()
-        rows[0].sessions, rows[0].last = 11, 1.0
-        app = c_tui.Pult(rows)
-        async with app.run_test() as pilot:
-            await pilot.pause()
-            await pilot.press('enter')
-        row, action, name = app.return_value
-        self.assertEqual((row.depth, action), (0, 'continue'))
-
-    async def test_live_entries_without_session_id_are_all_shown(self):
-        root, rows = make_tree()
-        rows[0].live = [{'sessionId': None, 'name': 'a', 'state': 'working', 'blocked': False},
-                        {'sessionId': None, 'name': 'b', 'state': 'working', 'blocked': False}]
-        app = c_tui.Pult(rows)
-        async with app.run_test() as pilot:
-            await pilot.pause()
-            self.assertEqual(app.query_one('#live').option_count, 2)
-
-    async def test_bracket_in_names_does_not_crash(self):
-        root, rows = make_tree()
-        rows[0].live = [{'sessionId': 's', 'name': 'takt [черновик', 'state': 'working', 'blocked': False}]
-        app = c_tui.Pult(rows)
-        async with app.run_test() as pilot:
-            await pilot.pause()
-            self.assertIn('[черновик', str(app.query_one('#live').get_option_at_index(0).prompt))
-
-    async def test_q_quits_without_result(self):
-        root, rows = make_tree()
-        app = c_tui.Pult(rows)
-        async with app.run_test() as pilot:
-            await pilot.press('q')
-        self.assertIsNone(app.return_value)
-
-
-def segment_with_sessions(rows):
-    seg = next(r for r in rows if r.depth == 1 and r.label == 'kvant-lab')
-    seg.sessions, seg.last = 11, 1.0
-    return seg
-
-
-class Segments(unittest.IsolatedAsyncioTestCase):
-    async def test_segment_label_shows_its_sessions(self):
-        root, rows = make_tree()
-        segment_with_sessions(rows)
-        app = c_tui.Pult(rows)
+    async def test_no_emoji_in_tree(self):
+        app = c_tui.Pult(self.rows())
         async with app.run_test():
-            node = app.query_one('#tree').root.children[0]
-            self.assertIn('11 сесс', str(node.label))
-
-    async def test_enter_on_segment_toggles_and_continue_button_resumes_there(self):
-        root, rows = make_tree()
-        segment_with_sessions(rows)
-        app = c_tui.Pult(rows)
-        async with app.run_test() as pilot:
-            tree = app.query_one('#tree')
-            seg = tree.root.children[0]
-            tree.move_cursor(seg)
-            await pilot.pause()
-            was = seg.is_expanded
-            await pilot.press('enter')
-            await pilot.pause()
-            self.assertIsNone(app.return_value)       # Enter раскрывает сегмент, а не запускает claude
-            self.assertNotEqual(seg.is_expanded, was)
-            self.assertTrue(app.query_one('#continue').display)
-            await pilot.click('#continue')
-        row, action, name = app.return_value
-        self.assertEqual((row.label, action), ('kvant-lab', 'continue'))
-
-    async def test_segment_without_sessions_hides_continue(self):
-        root, rows = make_tree()
-        app = c_tui.Pult(rows)
-        async with app.run_test() as pilot:
-            tree = app.query_one('#tree')
-            tree.move_cursor(tree.root.children[1])   # clients, сессий нет
-            await pilot.pause()
-            self.assertFalse(app.query_one('#continue').display)
+            labels = ' '.join(str(n.label) for n in c_tui.walk(app.query_one('#tree').root))
+            self.assertFalse(any(ord(ch) > 0x2600 for ch in labels), labels)
 
 
-class SessionList(unittest.IsolatedAsyncioTestCase):
-    def setUp(self):
-        self.root, self.rows = make_tree()
-        self.projects, self.saved = tempfile.mkdtemp(), c.PROJECTS
-        c.PROJECTS = self.projects
-        self.takt = next(r for r in self.rows if r.label == 'takt')
-        folder = os.path.join(self.projects, c.encode(self.takt.path))
-        os.makedirs(folder)
-        for i, (sid, title, prompt) in enumerate([('old1', '', 'сделай ролик про кейс'),
-                                                  ('new2', 'takt · оценка', 'оцени ТЗ на ERP')]):
-            with open(os.path.join(folder, sid + '.jsonl'), 'w', encoding='utf-8') as fh:
-                if title:
-                    fh.write(json.dumps({'type': 'custom-title', 'customTitle': title}, ensure_ascii=False) + '\n')
-                fh.write(json.dumps({'type': 'user', 'message': {'content': prompt}, 'cwd': self.takt.path,
-                                     'timestamp': '2026-10-23T13:18:58Z'}, ensure_ascii=False) + '\n')
-            os.utime(os.path.join(folder, sid + '.jsonl'), (1000 + i, 1000 + i))
-        self.takt.sessions, self.takt.last = 2, 1001.0
-
-    def tearDown(self):
-        c.PROJECTS = self.saved
-
-    async def open_takt(self, app, pilot):
-        tree = app.query_one('#tree')
-        tree.move_cursor(next(n for n in tree.root.children[0].children if n.data.label == 'takt'))
-        await pilot.pause()
-        await app.workers.wait_for_complete()
-        await pilot.pause()
-
-    async def test_lists_sessions_newest_first_with_details(self):
-        app = c_tui.Pult(self.rows)
-        async with app.run_test(size=(140, 45)) as pilot:
-            await self.open_takt(app, pilot)
-            lst = app.query_one('#sessions')
-            self.assertEqual(lst.option_count, 2)
-            self.assertIn('takt · оценка', str(lst.get_option_at_index(0).prompt))
-            self.assertIn('сделай ролик', str(lst.get_option_at_index(1).prompt))   # безымянная — по первому запросу
-            con = Console(width=120, record=True, file=io.StringIO())
-            con.print(app.query_one('#detail').content)
-            self.assertIn('оцени ТЗ на ERP', con.export_text())
-
-    async def test_enter_on_session_opens_exactly_it(self):
-        app = c_tui.Pult(self.rows)
-        async with app.run_test(size=(140, 45)) as pilot:
-            await self.open_takt(app, pilot)
-            await pilot.press('tab')
-            self.assertEqual(app.focused.id, 'sessions')
-            await pilot.press('down', 'enter')
-        row, action, name = app.return_value
-        self.assertEqual((row.label, action), ('takt', 'session:old1'))
-
-    async def test_live_session_waiting_for_answer_is_said_so(self):
-        self.takt.live = [{'sessionId': 'new2', 'name': 'takt · оценка', 'state': 'blocked', 'blocked': True}]
-        app = c_tui.Pult(self.rows)
-        async with app.run_test(size=(140, 45)) as pilot:
-            await self.open_takt(app, pilot)
-            con = Console(width=120, record=True, file=io.StringIO())
-            con.print(app.query_one('#detail').content)
-            self.assertIn('ждёт вашего ответа', con.export_text())
-
-    async def test_enter_on_live_background_session_attaches(self):
-        # claude -r на живую фоновую сессию открыл бы второй процесс той же сессии
-        self.takt.live = [{'sessionId': 'new2', 'id': 'new2abc', 'kind': 'background', 'name': 'takt · оценка',
-                           'state': 'working', 'blocked': False}]
-        app = c_tui.Pult(self.rows)
-        async with app.run_test(size=(140, 45)) as pilot:
-            await self.open_takt(app, pilot)
-            app.query_one('#sessions').focus()
-            await pilot.press('enter')
-        self.assertEqual(app.return_value[1], 'bg:new2abc')
-
-    async def test_cut_bracket_in_first_prompt_does_not_crash(self):
-        folder = os.path.join(self.projects, c.encode(self.takt.path))
-        with open(os.path.join(folder, 'old1.jsonl'), 'w', encoding='utf-8') as fh:
-            fh.write(json.dumps({'type': 'user', 'cwd': self.takt.path, 'timestamp': '2026-10-23T13:18:58Z', 'message':
-                                 {'content': 'посмотри на эту картинку пожалуйста и скажи [Image #2] что на ней'}},
-                                ensure_ascii=False) + '\n')
-        os.utime(os.path.join(folder, 'old1.jsonl'), (1000, 1000))
-        app = c_tui.Pult(self.rows)
-        async with app.run_test(size=(140, 45)) as pilot:
-            await self.open_takt(app, pilot)
-            lst = app.query_one('#sessions')
-            self.assertEqual(lst.option_count, 2)
-            lst.highlighted = 1
-            await pilot.pause()
-            app.save_screenshot(os.path.join(tempfile.mkdtemp(), 'x.svg'))   # отрисовка разметки
-        self.assertIsNone(app.return_value)
-
-    async def test_results_of_previous_folder_are_ignored(self):
-        app = c_tui.Pult(self.rows)
-        async with app.run_test(size=(140, 45)) as pilot:
-            await self.open_takt(app, pilot)
-            other = next(r for r in self.rows if r.label == 'sova')
-            brief = dict(c.session_brief(next(iter(c.folder_sessions(self.takt.path)))), id='чужая')
-            app.fill_sessions(other, [brief])
-            app.fill_detail(other, 'new2', {'last_user': 'чужое', 'last_answer': '', 'error': '', 'branch': '', 'places': []})
-            await pilot.pause()
-            lst = app.query_one('#sessions')
-            self.assertEqual([lst.get_option_at_index(i).id for i in range(lst.option_count)], ['new2', 'old1'])
-            self.assertNotEqual(app.details.get('new2', {}).get('last_user'), 'чужое')
-
-    async def test_enter_on_session_open_in_another_terminal_warns(self):
-        self.takt.live = [{'sessionId': 'new2', 'id': None, 'kind': 'interactive', 'pid': 7, 'name': 'claude-3',
-                           'state': 'busy', 'blocked': False}]
-        app = c_tui.Pult(self.rows)
-        async with app.run_test(size=(140, 45)) as pilot:
-            await self.open_takt(app, pilot)
-            app.query_one('#sessions').focus()
-            await pilot.press('enter')
-            await pilot.pause()
-            self.assertIsNone(app.return_value)
-            self.assertTrue(any('другом терминале' in str(n.message) for n in app._notifications))
-
-    async def test_escape_from_sessions_goes_back_to_tree(self):
-        app = c_tui.Pult(self.rows)
-        async with app.run_test(size=(140, 45)) as pilot:
-            await self.open_takt(app, pilot)
-            await pilot.press('tab', 'escape')
-            self.assertEqual(app.focused.id, 'tree')
-            self.assertIsNone(app.return_value)
+if __name__ == '__main__':
+    unittest.main()

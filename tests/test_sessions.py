@@ -409,9 +409,16 @@ class Find(unittest.TestCase):
         self.assertEqual(self.names('студии'), ['kp'])                         # описание папки
         self.assertEqual(self.names('  '), [i['name'] for i in self.items])
 
+    def test_segment_description_does_not_match_its_sessions(self):
+        # описание раздела перечисляет все его проекты («…сбор лидов…») — иначе «лид» находил бы всё из раздела
+        seg = c.Row('/r/kvant-lab', 1, 'kvant-lab', 'Студия: avto_lead/ (сбор и проверка лидов), takt/', project='kvant-lab')
+        it = {'brief': {'title': 'Документы', 'first': 'печать и подпись', 'last_user': ''}, 'row': seg, 'name': 'Документы', 'live': None}
+        self.assertEqual(c.find_sessions([it], 'лид'), [])
+        self.assertEqual(c.find_sessions([it], 'kvant-lab'), [it])
+
     def test_find_folders_by_description(self):
         root = c.Row('/r', 0, 'claude', 'корень: разбор задач, лиды')
-        seg = c.Row('/r/kvant-lab', 1, 'kvant-lab', 'Студия')
+        seg = c.Row('/r/kvant-lab', 1, 'kvant-lab', 'Студия: avto_lead/ (сбор лидов)')   # описание раздела не в счёт
         avto = c.Row('/r/kvant-lab/avto_lead', 2, 'avto_lead', 'сбор лидов с Яндекс.Карт', active=1.0)
         gate = c.Row('/r/kvant-lab/kvant-gate', 2, 'kvant-gate', 'обогащение лидов', active=2.0)
         takt = c.Row('/r/kvant-lab/takt', 2, 'takt', 'таск-менеджер')
