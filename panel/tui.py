@@ -149,8 +149,10 @@ def folder_line(r, words=()):
     t = _lit(nice_name(r), words)
     if r.what:
         t.append('  ' + _line(r.what, 200), 'dim')
-    t.no_wrap, t.overflow = True, 'ellipsis'
-    return t
+    g = Table.grid(expand=True)            # таблица, а не Text: список переносит длинный Text, no_wrap не помогает
+    g.add_column(ratio=1, no_wrap=True, overflow='ellipsis')
+    g.add_row(t)
+    return g
 
 
 def detail_view(item, d):
