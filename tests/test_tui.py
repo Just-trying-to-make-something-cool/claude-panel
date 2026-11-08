@@ -1,5 +1,5 @@
 """Безголовые тесты окна: .venv/bin/python -m unittest discover tests"""
-import io, json, os, sys, tempfile, unittest
+import io, json, os, sys, tempfile, time, unittest
 
 from rich.console import Console
 
@@ -18,6 +18,8 @@ def make_tree():
         if r.label == 'autovoronka':
             r.sessions, r.last = 3, 1.0
             r.live = [{'sessionId': 'abc', 'name': 'rop', 'state': 'busy', 'blocked': False}]
+        if r.label in ('autovoronka', 'takt'):
+            r.active = time.time()          # недавняя работа: проект сверху сегмента, а не в «давно не открывались»
     return root, rows
 
 
@@ -34,6 +36,44 @@ class Order(unittest.TestCase):
         root, rows = make_tree()
         segs = [r.label for r in c_tui.ordered(rows) if r.depth == 1]
         self.assertEqual(segs, ['kvant-lab', 'clients'])
+
+
+class Fresh(unittest.IsolatedAsyncioTestCase):
+    def rows(self):
+        root = tempfile.mkdtemp()
+        for p in ('kvant-lab/takt', 'kvant-lab/autovoronka', 'kvant-lab/old/.claude/worktrees/w', 'kvant-lab/zold',
+                  'clients/sova'):
+            os.makedirs(os.path.join(root, p))
+        rows, now = c.discover(root), time.time()
+        for r in rows:
+            r.active = {'takt': now - 3600, 'autovoronka': now - 3 * 86400, 'old': now - 40 * 86400}.get(r.label, 0.0)
+        return rows
+
+    async def test_fresh_first_newest_on_top_rest_folded(self):
+        app = c_tui.Pult(self.rows())
+        async with app.run_test():
+            kl, cl = app.query_one('#tree').root.children[:2]
+            names = [n.data.label if n.data else str(n.label) for n in kl.children]
+            self.assertEqual(names, ['takt', 'autovoronka', 'давно не открывались · 2'])   # свежее выше, не по алфавиту
+            old = kl.children[2]
+            self.assertFalse(old.is_expanded)
+            self.assertEqual([n.data.label for n in old.children], ['old', 'zold'])
+            self.assertEqual([n.data.label for n in old.children[0].children], ['w'])   # части не теряются
+            self.assertTrue(kl.is_expanded)
+            self.assertFalse(cl.is_expanded)                  # в «Клиентах» свежего нет — сегмент свёрнут
+            self.assertEqual(str(cl.children[0].label), 'давно не открывались · 1')
+
+    async def test_enter_on_folded_group_opens_it(self):
+        app = c_tui.Pult(self.rows())
+        async with app.run_test() as pilot:
+            tree = app.query_one('#tree')
+            old = tree.root.children[0].children[2]
+            tree.move_cursor(old)
+            await pilot.pause()
+            await pilot.press('enter')
+            await pilot.pause()
+            self.assertTrue(old.is_expanded)
+            self.assertIsNone(app.return_value)
 
 
 class Tui(unittest.IsolatedAsyncioTestCase):

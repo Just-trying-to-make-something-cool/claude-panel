@@ -75,6 +75,7 @@ class Row:
     sessions: int = 0
     last: float = 0.0
     live: list = dataclasses.field(default_factory=list)
+    active: float = 0.0  # когда здесь последний раз шла работа, см. add_activity
 
 
 def _subdirs(d):
@@ -357,23 +358,122 @@ def _place(cwd, root):
     return cwd.replace(H, '~')
 
 
-def _places(f, root):
-    """[(проект, доля %)] по полям cwd, файл читается кусками по CHUNK."""
-    counts, carry = {}, b''
-    with open(f, 'rb') as fh:
-        while True:
-            chunk = fh.read(CHUNK)
-            blob = carry + chunk
-            cut = len(blob) if not chunk else blob.rfind(b'\n') + 1   # недописанная строка — в следующий кусок
-            carry, blob = blob[cut:], blob[:cut]
+def _count_cwd(fh, root, counts, tail=False):
+    """Добавляет в counts {место: число записей} по полям cwd от текущей позиции до конца файла, кусками
+    по CHUNK. Возвращает позицию после последней целой строки; tail — посчитать и недописанную последнюю."""
+    pos, carry = fh.tell(), b''
+    while True:
+        chunk = fh.read(CHUNK)
+        blob = carry + chunk
+        cut = len(blob) if not chunk else blob.rfind(b'\n') + 1   # недописанная строка — в следующий кусок
+        carry, blob = blob[cut:], blob[:cut]
+        if chunk or tail:
             for raw in _CWD.findall(blob):
                 p = _place(_unq(raw), root)
                 counts[p] = counts.get(p, 0) + 1
-            if not chunk:
-                break
+        if not chunk:
+            return pos
+        pos += len(blob)
+
+
+def _share(counts):
+    """[(место, доля %)] от 3%, крупные первыми."""
     total = sum(counts.values()) or 1
     ranked = sorted(counts.items(), key=lambda kv: -kv[1])
-    return [(p, round(100 * n / total)) for p, n in ranked[:3] if 100 * n / total >= 3]
+    return [(p, round(100 * n / total)) for p, n in ranked if 100 * n / total >= 3]
+
+
+def _places(f, root):
+    """[(проект, доля %)] по полям cwd, не больше трёх."""
+    counts = {}
+    with open(f, 'rb') as fh:
+        _count_cwd(fh, root, counts, tail=True)
+    return _share(counts)[:3]
+
+
+# ---------- где недавно шла работа ----------
+
+FRESH_DAYS = 14                          # папка наверху дерева, если работа в ней шла за столько дней
+PLACES_CACHE = ZDIR + '/places.json'
+_AUTO = re.compile(rb'"entrypoint":\s*"sdk-')    # claude -p: ежедневный прогон или задача пульта
+
+
+def _grown(f, root, old):
+    """{pos, counts, auto}: места сессии и запущена ли она без человека. Стенограммы только дописываются,
+    поэтому из прошлого прохода old берём счётчики и дочитываем новый хвост; файл стал короче или кэш
+    испорчен — считаем с нуля."""
+    with open(f, 'rb') as fh:
+        size = os.fstat(fh.fileno()).st_size
+        try:
+            pos, counts, auto = int(old['pos']), {str(k): int(v) for k, v in old['counts'].items()}, bool(old['auto'])
+            if not 0 <= pos <= size:
+                raise ValueError
+        except Exception:
+            pos, counts, auto = 0, {}, bool(_AUTO.search(fh.read(HEAD)))
+        fh.seek(pos)
+        return {'pos': _count_cwd(fh, root, counts), 'counts': counts, 'auto': auto}
+
+
+def _load_places(cache, root):
+    try:
+        with open(cache, encoding='utf-8') as fh:
+            d = json.load(fh)
+        return d['files'] if d.get('root') == root and isinstance(d.get('files'), dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_places(cache, root, files):
+    try:
+        os.makedirs(os.path.dirname(cache), exist_ok=True)
+        tmp = f'{cache}.{os.getpid()}'
+        with open(tmp, 'w', encoding='utf-8') as fh:
+            json.dump({'root': root, 'files': files}, fh, ensure_ascii=False)
+        os.replace(tmp, cache)
+    except OSError:
+        pass
+
+
+def add_activity(rows, now=None, projects=None, cache=PLACES_CACHE):
+    """Row.active — когда в папке последний раз шла работа: её сессии и сессии её частей, живая сессия
+    (значит, сейчас), а ещё сессии из корня и сегментов, которые уходили в неё работать (поля cwd,
+    доля от 3%). Дата такой работы — последняя запись сессии, а не момент захода в папку. Сессии без
+    человека (claude -p) в чужие папки не засчитываются: иначе ежедневная проверка сайтов поднимала бы
+    наверх всё, что проверила. Из корня и сегментов смотрим только сессии моложе FRESH_DAYS, их
+    счётчики мест держит кэш в ~/.cache."""
+    now = now or time.time()
+    root = rows[0].path
+    by_path = {r.path: r for r in rows}
+    for r in rows:
+        r.active = max(r.last, now if r.live else 0.0)
+    for r in rows:
+        up = by_path.get(os.path.dirname(r.path.replace('/.claude/worktrees', ''))) if r.depth == 3 else None
+        if up is not None:
+            up.active = max(up.active, r.active)
+    memo, seen = _load_places(cache, root), {}
+    for r in rows:
+        if r.depth > 1:
+            continue
+        for f in folder_sessions(r.path, projects=projects):
+            m = _mtime(f)
+            if now - m > FRESH_DAYS * 86400:
+                break                                       # дальше только старее
+            try:
+                seen[f] = _grown(f, root, memo.get(f))
+            except OSError:
+                continue
+            if seen[f]['auto']:
+                continue
+            for p, _ in _share(seen[f]['counts']):
+                to = by_path.get(root if p == '~/claude' else os.path.join(root, p))
+                if to is not None:
+                    to.active = max(to.active, m)
+    _save_places(cache, root, seen)
+    return rows
+
+
+def is_fresh(r, now=None):
+    return (now or time.time()) - r.active < FRESH_DAYS * 86400
 
 
 def session_detail(f, root=ROOT):
