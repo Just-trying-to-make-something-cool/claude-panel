@@ -273,6 +273,15 @@ class Activity(unittest.TestCase):
         with open(self.cache) as fh:
             self.assertNotIn(p, json.load(fh)['files'])       # старые стенограммы не читаются вовсе
 
+    def test_visitors_from_root_session(self):
+        old = os.path.join(self.root, 'kvant-lab', 'old')
+        here = self.session('', [answer('y', cwd=old)] * 5, 1)
+        self.session('', [answer('y', cwd=old)] * 5, 1, 's2', auto=True)
+        rare = self.session('', [answer('y', cwd=old)] + [answer('y', cwd=self.root)] * 15, 1, 's3')   # ~6%: заходила мимоходом
+        rows = self.rows()
+        self.assertEqual(rows['old'].visitors, [here])
+        self.assertNotIn(rare, rows['old'].visitors)
+
     def test_cache_reads_only_new_tail(self):
         p = self.session('', [answer('y', cwd=os.path.join(self.root, 'kvant-lab/old'))] * 5, 1)
         self.rows()
@@ -298,3 +307,116 @@ class Activity(unittest.TestCase):
             with open(self.cache, 'w') as fh:
                 fh.write(junk)
             self.assertEqual({k: r.active for k, r in self.rows().items()}, cold, junk)
+
+
+class BriefForList(unittest.TestCase):
+    """Что карточка сессии несёт для общего списка: робот ли это и последний запрос."""
+
+    def test_brief_marks_robot_and_last_prompt(self):
+        p = write([dict(user('проверь сайты'), entrypoint='sdk-cli'), answer('ок'), user('а теперь боты'), answer('готово')])
+        b = c.session_brief(p)
+        self.assertTrue(b['auto'])
+        self.assertEqual(b['last_user'], 'а теперь боты')
+        self.assertFalse(c.session_brief(write([dict(user('x'), entrypoint='cli')], name='s2'))['auto'])
+
+    def test_last_prompt_from_tail_of_big_file(self):
+        filler = [answer('x' * 1000) for _ in range(400)]
+        p = write([user('первый')] + filler + [user('последний'), answer('ок')])
+        self.assertGreater(os.path.getsize(p), c.HEAD)
+        self.assertEqual(c.session_brief(p)['last_user'], 'последний')
+
+
+class DisplayName(unittest.TestCase):
+    seg = c.Row('/r/kvant-lab', 1, 'kvant-lab', project='kvant-lab')
+    proj = c.Row('/r/clients/nicky', 2, 'nicky', project='nicky')
+    part = c.Row('/r/kvant-lab/autovoronka/.claude/worktrees/base-check', 3, 'base-check', project='autovoronka')
+
+    def b(self, title='', first='проверь, что с переездом\nна новый домен', last_user=''):
+        return {'title': title, 'first': first, 'last_user': last_user}
+
+    def test_strips_project_prefix(self):
+        self.assertEqual(c.display_name(self.b('kvant-lab · горячие лиды личка'), self.seg), 'горячие лиды личка')
+
+    def test_name_equal_to_folder_shows_first_prompt_line(self):
+        for t in ('nicky', 'nicky (2)', ''):
+            self.assertEqual(c.display_name(self.b(t), self.proj), 'проверь, что с переездом', t)
+
+    def test_part_named_after_itself_shows_first_prompt(self):
+        self.assertEqual(c.display_name(self.b('autovoronka · base-check'), self.part), 'проверь, что с переездом')
+
+    def test_continuation_without_title_never_shows_service_phrase(self):
+        self.assertEqual(c.display_name(self.b('', c.CONTINUED, 'доделай КП'), self.proj), 'доделай КП')
+        self.assertEqual(c.display_name(self.b('', c.CONTINUED, ''), self.proj), 'продолжение прошлой сессии')
+
+    def test_nothing_at_all(self):
+        self.assertEqual(c.display_name(self.b('', '', ''), self.proj), 'без имени')
+
+
+class AllSessions(unittest.TestCase):
+    DAY = 86400
+
+    def setUp(self):
+        self.root, self.projects = tempfile.mkdtemp(), tempfile.mkdtemp()
+        for p in ('kvant-lab/takt', 'kvant-lab/autovoronka/.claude/worktrees/agent-0123456789abcdef'):
+            os.makedirs(os.path.join(self.root, p))
+        self.now = time.time()
+
+    def session(self, folder, name, age_days, auto=False, title=''):
+        d = os.path.join(self.projects, c.encode(os.path.join(self.root, folder) if folder else self.root))
+        os.makedirs(d, exist_ok=True)
+        lines = [dict(user(name), entrypoint='sdk-cli' if auto else 'cli')]
+        if title:
+            lines.append({'type': 'custom-title', 'customTitle': title})
+        p = write(lines, d, name)
+        os.utime(p, (self.now - age_days * self.DAY,) * 2)
+        return p
+
+    def test_all_sessions_hides_robots_waiting_first(self):
+        self.session('kvant-lab/takt', 'takt-human', 1, title='takt · бизнес')
+        self.session('kvant-lab/takt', 'takt-robot', 0, auto=True)
+        self.session('', 'root-human', 2)
+        self.session('kvant-lab', 'robot-waiting', 5, auto=True)
+        self.session('kvant-lab/autovoronka/.claude/worktrees/agent-0123456789abcdef', 'subagent', 0)
+        rows = c.discover(self.root)
+        seg = next(r for r in rows if r.label == 'kvant-lab')
+        seg.live = [{'sessionId': 'robot-waiting', 'blocked': True, 'state': 'blocked'}]
+        items = c.all_sessions(rows, projects=self.projects)
+        self.assertEqual([i['brief']['id'] for i in items], ['robot-waiting', 'takt-human', 'root-human'])
+        self.assertEqual(items[1]['row'].label, 'takt')           # открывать из папки запуска
+        self.assertEqual(items[1]['name'], 'бизнес')
+        self.assertTrue(items[0]['live']['blocked'])
+        self.assertIsNone(items[1]['live'])
+
+
+def item(name, first='', last_user='', label='x', what='', title=''):
+    row = c.Row('/r/' + label, 2, label, what, project=label)
+    return {'brief': {'title': title or name, 'first': first, 'last_user': last_user}, 'row': row, 'name': name, 'live': None}
+
+
+class Find(unittest.TestCase):
+    items = [item('горячие лиды личка', 'оценка писем', label='kvant-lab'),
+             item('сотрудник секретарь', 'агенты по-человечески', 'всё ещё грубо', label='kvant-lab'),
+             item('kp', 'КП для Вадима', label='kp', what='стандартное КП студии')]
+
+    def names(self, q):
+        return [i['name'] for i in c.find_sessions(self.items, q)]
+
+    def test_find_sessions_all_words_case_yo(self):
+        self.assertEqual(self.names('ЛИДЫ'), ['горячие лиды личка'])
+        self.assertEqual(self.names('лиды личка'), ['горячие лиды личка'])
+        self.assertEqual(self.names('лиды секретарь'), [])
+        self.assertEqual(self.names('все еще'), ['сотрудник секретарь'])     # ё = е, последний запрос
+        self.assertEqual(self.names('студии'), ['kp'])                         # описание папки
+        self.assertEqual(self.names('  '), [i['name'] for i in self.items])
+
+    def test_find_folders_by_description(self):
+        root = c.Row('/r', 0, 'claude', 'корень: разбор задач, лиды')
+        seg = c.Row('/r/kvant-lab', 1, 'kvant-lab', 'Студия')
+        avto = c.Row('/r/kvant-lab/avto_lead', 2, 'avto_lead', 'сбор лидов с Яндекс.Карт', active=1.0)
+        gate = c.Row('/r/kvant-lab/kvant-gate', 2, 'kvant-gate', 'обогащение лидов', active=2.0)
+        takt = c.Row('/r/kvant-lab/takt', 2, 'takt', 'таск-менеджер')
+        agent = c.Row('/r/kvant-lab/takt/.claude/worktrees/agent-0123456789abcdef', 3, 'agent-0123456789abcdef', 'лиды')
+        rows = [root, seg, avto, gate, takt, agent]
+        self.assertEqual([r.label for r in c.find_folders(rows, 'лид')], ['kvant-gate', 'avto_lead'])
+        self.assertEqual(c.find_folders(rows, ''), [])
+        self.assertEqual(len(c.find_folders(rows, 'а', limit=2)), 2)
