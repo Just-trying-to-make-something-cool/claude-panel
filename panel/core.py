@@ -76,6 +76,7 @@ class Row:
     last: float = 0.0
     live: list = dataclasses.field(default_factory=list)
     active: float = 0.0  # когда здесь последний раз шла работа, см. add_activity
+    visitors: list = dataclasses.field(default_factory=list)   # сессии корня и сегментов, работавшие здесь
 
 
 def _subdirs(d):
@@ -333,8 +334,14 @@ def _first_prompt(blob):
     return ''
 
 
+def _last_prompt(blob, cut_first):
+    texts = [t for t in map(user_text, _records(blob, cut_first, _USER)) if t]
+    return texts[-1] if texts else ''
+
+
 def session_brief(f):
-    """{id, file, title, first, started, last}: название, первый запрос, начало и последняя запись."""
+    """{id, file, title, first, last_user, auto, started, last}: название, первый и последний запрос (последний —
+    из уже прочитанного хвоста, нет его там — ''), запущена ли без человека, начало и последняя запись."""
     def build(st):
         head = _read(f, 0, HEAD)
         tail = _read(f, max(0, st.st_size - TAIL), TAIL) if st.st_size > HEAD else b''
@@ -346,7 +353,8 @@ def session_brief(f):
             first, seen = _first_prompt(_read(f, 0, span)), span
         ts = _TS.search(head)
         return {'id': os.path.basename(f)[:-6], 'file': f, 'title': _unq(titles[-1]) if titles else '',
-                'first': first, 'started': _epoch(ts.group(1).decode()) if ts else 0.0, 'last': st.st_mtime}
+                'first': first, 'last_user': _last_prompt(tail or head, bool(tail)), 'auto': bool(_AUTO.search(head)),
+                'started': _epoch(ts.group(1).decode()) if ts else 0.0, 'last': st.st_mtime}
     return _cached('brief', f, build)
 
 
@@ -395,6 +403,7 @@ def _places(f, root):
 
 FRESH_DAYS = 14                          # папка наверху дерева, если работа в ней шла за столько дней
 PLACES_CACHE = ZDIR + '/places.json'
+VISIT_SHARE = 10                         # с какой доли cwd сессия из корня считается работой над папкой
 _AUTO = re.compile(rb'"entrypoint":\s*"sdk-')    # claude -p: ежедневный прогон или задача пульта
 
 
@@ -440,12 +449,13 @@ def add_activity(rows, now=None, projects=None, cache=PLACES_CACHE):
     доля от 3%). Дата такой работы — последняя запись сессии, а не момент захода в папку. Сессии без
     человека (claude -p) в чужие папки не засчитываются: иначе ежедневная проверка сайтов поднимала бы
     наверх всё, что проверила. Из корня и сегментов смотрим только сессии моложе FRESH_DAYS, их
-    счётчики мест держит кэш в ~/.cache."""
+    счётчики мест держит кэш в ~/.cache. Попутно Row.visitors — такие сессии с долей от VISIT_SHARE%,
+    свежие первыми: их окно показывает в работе над папкой."""
     now = now or time.time()
     root = rows[0].path
     by_path = {r.path: r for r in rows}
     for r in rows:
-        r.active = max(r.last, now if r.live else 0.0)
+        r.active, r.visitors = max(r.last, now if r.live else 0.0), []
     for r in rows:
         up = by_path.get(os.path.dirname(r.path.replace('/.claude/worktrees', ''))) if r.depth == 3 else None
         if up is not None:
@@ -464,16 +474,90 @@ def add_activity(rows, now=None, projects=None, cache=PLACES_CACHE):
                 continue
             if seen[f]['auto']:
                 continue
-            for p, _ in _share(seen[f]['counts']):
+            for p, share in _share(seen[f]['counts']):
                 to = by_path.get(root if p == '~/claude' else os.path.join(root, p))
                 if to is not None:
                     to.active = max(to.active, m)
+                    if share >= VISIT_SHARE and to is not r:
+                        to.visitors.append(f)
     _save_places(cache, root, seen)
+    for r in rows:
+        r.visitors.sort(key=_mtime, reverse=True)
     return rows
 
 
 def is_fresh(r, now=None):
     return (now or time.time()) - r.active < FRESH_DAYS * 86400
+
+
+# ---------- общий список сессий и поиск ----------
+
+def _line1(s):
+    return ' '.join(s.split('\n')[0].split())
+
+
+def display_name(b, row):
+    """Подпись сессии в общем списке. Название без приписки «<проект> · »; пустое или повторяющее имя
+    папки («nicky», «nicky (2)») — первая строка первого запроса; у продолжения после предела контекста
+    первый запрос служебный — тогда последний запрос."""
+    t = ' '.join(b['title'].split())
+    for p in {row.project, row.label} - {''}:
+        if t.startswith(p + ' · '):
+            t = t[len(p) + 3:]
+    if t and not re.fullmatch('(%s)( \\(\\d+\\))?' % '|'.join(map(re.escape, {row.project, row.label} - {''})), t):
+        return t
+    if b['first'] == CONTINUED:
+        return _line1(b['last_user']) or 'продолжение прошлой сессии'
+    return _line1(b['first']) or _line1(b['last_user']) or 'без имени'
+
+
+def all_sessions(rows, projects=None):
+    """[{brief, row, name, live}] — сессии всех папок rows, row — папка запуска (из неё их и открывать).
+    Без служебных копий субагентов и без прогонов без человека, кроме ждущих ответа. Ждущие ответа
+    первыми, дальше свежие выше."""
+    out = []
+    for r in rows:
+        if r.depth == 3 and AGENT_WT.match(r.label):
+            continue
+        live = {s.get('sessionId'): s for s in r.live}
+        for f in folder_sessions(r.path, projects=projects):
+            try:
+                b = session_brief(f)
+            except OSError:
+                continue
+            s = live.get(b['id'])
+            if b['auto'] and not (s and s.get('blocked')):
+                continue
+            out.append({'brief': b, 'row': r, 'name': display_name(b, r), 'live': s})
+    out.sort(key=lambda i: (not (i['live'] or {}).get('blocked'), -i['brief']['last']))
+    return out
+
+
+def _words(q):
+    return q.lower().replace('ё', 'е').split()
+
+
+def _has(words, *texts):
+    hay = ' '.join(texts).lower().replace('ё', 'е')
+    return all(w in hay for w in words)
+
+
+def find_sessions(items, query):
+    """Сессии, где все слова запроса (регистр и ё не важны) есть в имени, названии, первом или последнем
+    запросе либо в имени и описании папки. Пустой запрос — все."""
+    words = _words(query)
+    return [i for i in items if _has(words, i['name'], i['brief']['title'], i['brief']['first'],
+                                     i['brief']['last_user'], i['row'].label, i['row'].what)]
+
+
+def find_folders(rows, query, limit=5):
+    """Папки (сегменты, проекты, части без копий субагентов), где все слова запроса есть в имени или
+    описании; свежие первыми. Пустой запрос — ничего."""
+    words = _words(query)
+    if not words:
+        return []
+    hit = [r for r in rows if r.depth >= 1 and not (r.depth == 3 and AGENT_WT.match(r.label)) and _has(words, r.label, r.what)]
+    return sorted(hit, key=lambda r: -r.active)[:limit]
 
 
 def session_detail(f, root=ROOT):
