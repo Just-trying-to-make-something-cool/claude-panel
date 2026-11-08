@@ -544,19 +544,21 @@ def _has(words, *texts):
 
 def find_sessions(items, query):
     """Сессии, где все слова запроса (регистр и ё не важны) есть в имени, названии, первом или последнем
-    запросе либо в имени и описании папки. Пустой запрос — все."""
+    запросе либо в имени папки запуска; описание папки — только у проектов и частей: описание раздела
+    перечисляет все его проекты, и «лид» находил бы всё, что запущено из раздела. Пустой запрос — все."""
     words = _words(query)
-    return [i for i in items if _has(words, i['name'], i['brief']['title'], i['brief']['first'],
-                                     i['brief']['last_user'], i['row'].label, i['row'].what)]
+    return [i for i in items if _has(words, i['name'], i['brief']['title'], i['brief']['first'], i['brief']['last_user'],
+                                     i['row'].label, i['row'].what if i['row'].depth >= 2 else '')]
 
 
 def find_folders(rows, query, limit=5):
-    """Папки (сегменты, проекты, части без копий субагентов), где все слова запроса есть в имени или
-    описании; свежие первыми. Пустой запрос — ничего."""
+    """Папки (разделы, проекты, части без копий субагентов), где все слова запроса есть в имени или
+    описании (у раздела — только в имени, см. find_sessions); свежие первыми. Пустой запрос — ничего."""
     words = _words(query)
     if not words:
         return []
-    hit = [r for r in rows if r.depth >= 1 and not (r.depth == 3 and AGENT_WT.match(r.label)) and _has(words, r.label, r.what)]
+    hit = [r for r in rows if r.depth >= 1 and not (r.depth == 3 and AGENT_WT.match(r.label))
+           and _has(words, r.label, r.what if r.depth >= 2 else '')]
     return sorted(hit, key=lambda r: -r.active)[:limit]
 
 

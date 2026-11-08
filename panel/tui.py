@@ -1,47 +1,67 @@
 """Панель управления папками Claude: окно в терминале (Textual). Данные и запуск — в core.py.
 
-Слева дерево ~/claude: корень, сегменты → проекты → части. В сегменте сверху проекты, где работа шла
-за последние две недели (c.FRESH_DAYS), свежие выше; остальные свёрнуты в «давно не открывались».
-У проекта видно, когда в нём последний раз работали, у корня и сегментов — сколько сессий запущено
-прямо из них. Справа карточка выбранного: описание,
-где живёт, кнопки «Продолжить», «Новая сессия», «Все сессии», живые сессии и список сессий папки.
-Под списком — что внутри выбранной сессии: первый и последний запрос, чем закончилась, где шла работа.
+Два режима, Tab переключает.
 
-Клавиши: ↑↓ по дереву · Enter продолжить (на сегменте — раскрыть) · Tab к списку сессий, Enter открыть
-выбранную · n новая · r все сессии · Esc назад к дереву, ещё раз — выход · q выход. Мышь работает.
+Сессии — с него окно открывается. Строка поиска, под ней все ваши сессии из всех папок ~/claude:
+ждущие ответа первыми, дальше свежие выше. Справа — что внутри выбранной: где запущена и где работала,
+когда, первый и последний запрос, последний ответ. Печатайте слова из названия, запроса или имени папки —
+список сужается, ниже появляются папки, где можно начать новую сессию. ↑↓ выбрать, Enter открыть,
+Esc очистить поиск, ещё раз — выход. Прогоны без человека (claude -p) не показываются.
+
+Папки — дерево ~/claude: в разделе сверху папки, где работа шла за две недели, остальное свёрнуто
+в «давно не открывались». Справа описание папки и работа над ней, в том числе сессии, запущенные
+из раздела выше. Enter — новая сессия (спросит, о чём; на разделе — раскрыть), c — продолжить
+последнюю, → — к сессиям папки, q — выход. Мышь работает.
 """
-import os, re, sys, time
+import io, os, re, sys, time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from panel import core as c  # noqa: E402
 
-from rich.console import Group  # noqa: E402
-from rich.markup import escape as rich_escape  # noqa: E402
+from rich.console import Console, Group  # noqa: E402
 from rich.table import Table  # noqa: E402
 from rich.text import Text  # noqa: E402
 from textual import work  # noqa: E402
 from textual.app import App, ComposeResult  # noqa: E402
 from textual.binding import Binding  # noqa: E402
 from textual.containers import Horizontal, Vertical  # noqa: E402
-from textual.widgets import Button, Footer, Input, OptionList, Static, Tree  # noqa: E402
+from textual.content import Content  # noqa: E402
+from textual.widgets import Button, ContentSwitcher, Input, OptionList, Static, Tree  # noqa: E402
 from textual.widgets.option_list import Option  # noqa: E402
-from textual.worker import get_current_worker  # noqa: E402
 
 SEG_ORDER = ['kvant-lab', 'clients', 'infra', 'personal', 'work', 'claude-settings']
 SEG_NAMES = {'kvant-lab': 'KVANT LAB', 'clients': 'Клиенты', 'infra': 'Инфра', 'personal': 'Личное',
              'work': 'Разовые задачи', 'claude-settings': 'Настройки Claude'}
-SEG_ICONS = {'kvant-lab': '🧪', 'clients': '🤝', 'infra': '🧰', 'personal': '🌿', 'work': '📌', 'claude-settings': '🔧'}
-DOT = {'ЖДЁТ': '[bold yellow]●[/]', 'работает': '[blue]●[/]', 'живая': '[green]●[/]', '': ''}
-THEME = os.environ.get('C_THEME', 'catppuccin-mocha')
-LIST_LIMIT = 30                     # в папках автоворонки по 1300 сессий: показываем свежие
+STATUS = {'ЖДЁТ': '[bold yellow]ждёт ответа[/]', 'работает': '[green]идёт[/]', 'живая': '[green]открыта[/]', '': ''}
+THEME = os.environ.get('C_THEME', 'nord')
+WORK_LIMIT = 30
 BROKEN = ('ошибка входа', 'ошибка API', 'лимит')
-STATES = {'working': 'работает', 'busy': 'работает', 'idle': 'свободна'}
+HINTS = {'sessions': 'Enter — открыть · ↑↓ — выбрать · печатайте, чтобы искать · Tab — папки · Esc — очистить / выход',
+         'folders': 'Enter — новая сессия здесь (на разделе — раскрыть) · c — продолжить последнюю · → — сессии папки'
+                    ' · Tab — сессии · q — выход'}
 
 
 def esc(s):
     """Текст с диска для разметки Textual: экранируется каждая «[». Штатный escape пропускает
     незакрытые, и обрезанное «…скажи [Im…» роняло окно с MarkupError."""
     return re.sub(r'\\+(?=\[)', '', str(s)).rstrip('\\').replace('[', '\\[')
+
+
+def plain(x):
+    """Текст без оформления: разметка Textual, Content или что угодно из Rich."""
+    if isinstance(x, str):
+        return Content.from_markup(x).plain
+    if isinstance(x, Content):
+        return x.plain
+    con = Console(width=200, file=io.StringIO(), color_system=None, record=True)
+    con.print(x)
+    return con.export_text()
+
+
+def walk(node):
+    yield node
+    for ch in node.children:
+        yield from walk(ch)
 
 
 def plural(n, one, few, many):
@@ -60,17 +80,12 @@ def nice_name(r):
     return SEG_NAMES.get(r.label, r.label) if r.depth == 1 else r.label
 
 
-def status_text(r):
-    s = c._status(r)
-    return f'{DOT[s]} {s}' if s else ''
-
-
 def tree_label(r):
-    """У корня и сегментов — число своих сессий, у проектов — когда была последняя."""
+    """У корня и разделов — число своих сессий, у проектов — когда в них последний раз работали."""
     if r.depth == 0:
         name = '[bold]~/claude[/]'
     elif r.depth == 1:
-        name = f'{SEG_ICONS.get(r.label, "•")} [bold]{esc(nice_name(r))}[/]'
+        name = f'[bold]{esc(nice_name(r))}[/]'
     else:
         name = esc(r.label)
         if not (r.what or r.sessions) and r.depth == 2:
@@ -80,88 +95,11 @@ def tree_label(r):
         tail = f'[dim]{sessions_word(r.sessions)} · {c._ago(r.last)}[/]'
     elif r.depth >= 2 and r.active:
         tail = f'[dim]{c._ago(r.active)}[/]'
-    return '  '.join(x for x in (name, DOT[c._status(r)], tail) if x)
-
-
-def greeting(rows, now=None):
-    """Верхняя строка: приветствие по времени суток, живые сессии, где работали последний раз."""
-    h = time.localtime(now or time.time()).tm_hour
-    hi = 'Доброй ночи' if h < 5 else 'Доброе утро' if h < 12 else 'Добрый день' if h < 18 else 'Добрый вечер'
-    parts = [f'[bold]{hi}![/]']
-    rows = [r for r in rows if c.visible(r)]
-    live = [s for r in rows for s in r.live]
-    if live:
-        wait = sum(1 for s in live if s.get('blocked'))
-        parts.append(f'живых сессий в ~/claude: {len(live)}' + (f', [bold yellow]ждут ответа: {wait}[/]' if wait else ''))
-    last = max(rows, key=lambda r: r.last)
-    if last.last:
-        names = c.session_names(last.path, 1)
-        title = f'«{esc(names[0])}» ' if names else ''
-        parts.append(f'последняя работа: {title}в {esc(last.path.replace(c.H, "~"))}, {c.when(last.last)}')
-    return '   '.join(parts)
-
-
-def _line(s, n):
-    return c._cut(' '.join(s.split()), n)
-
-
-def session_line(b, d=None, here='', live=None):
-    """Строка списка: метка, название (у безымянной — первый запрос), когда, куда уходила работа."""
-    title = c._cut(b['title'], 56) if b['title'] else _line(b['first'], 48) or 'без имени'
-    live = live or {}
-    if b['id'] in live:
-        mark = '[bold yellow]●[/]' if live[b['id']] else '[green]●[/]'
-    else:
-        mark = '[yellow]⚠[/]' if d and d['error'] in BROKEN else ' '
-    line = f'{mark} {esc(title)}  [dim]{c.when(b["last"])}[/]'
-    away = [p for p, n in (d or {}).get('places', []) if p != here and n >= 20]
-    if away:
-        line += f'  [dim italic]→ {esc(away[0])}[/]'
-    return line
-
-
-def detail_view(b, d, live=None):
-    """Что внутри сессии: даты, где работала, первый и последний запрос, чем закончилась."""
-    t = Table.grid(padding=(0, 2))
-    t.add_column(style='dim', no_wrap=True)
-    t.add_column(ratio=1)
-    add = lambda k, v: t.add_row(k, Text.from_markup(v))
-    when = [f'начата {c.when(b["started"])}' if b['started'] else '', f'последняя запись {c.when(b["last"])}']
-    if d and d['branch'] not in ('', 'HEAD'):
-        when.append(f'ветка {rich_escape(d["branch"])}')
-    add('когда', ' · '.join(x for x in when if x))
-    if d and d['places']:
-        add('где работала', ' · '.join(f'{rich_escape(p)} [dim]{n}%[/]' for p, n in d['places']))
-    if b['first']:
-        add('первый запрос', rich_escape(_line(b['first'], 220)))
-    if d is None:
-        add('', '[dim]читаю стенограмму…[/]')
-    else:
-        if d['last_user'] and _line(d['last_user'], 220) != _line(b['first'], 220):
-            add('последний запрос', rich_escape(_line(d['last_user'], 220)))
-        if live and live.get('blocked'):
-            add('сейчас', '[bold yellow]● ждёт вашего ответа[/]')
-        elif live and live.get('kind') == 'interactive':
-            add('сейчас', '[green]● открыта в другом терминале[/] — переключитесь туда')
-        elif live:
-            add('сейчас', '[green]● идёт прямо сейчас[/]')
-        elif d['error'] == 'ошибка входа':
-            add('чем кончилась', '[yellow]⚠ оборвалась на ошибке входа[/] — откройте, выполните /login и напишите «продолжи»')
-        elif d['error'] == 'лимит':
-            add('чем кончилась', '[yellow]⚠ оборвалась на лимите[/] — когда лимит обновится, откройте и напишите «продолжи»')
-        elif d['error'] == 'ошибка API':
-            add('чем кончилась', '[yellow]⚠ оборвалась на ошибке API[/] — откройте и напишите «продолжи»')
-        elif d['error'] == 'без ответа':
-            add('чем кончилась', '[yellow]⚠ последний запрос остался без ответа[/]')
-        if d['last_answer']:
-            add('последний ответ', rich_escape(_line(d['last_answer'], 260)))
-    title = rich_escape(b['title'] or 'сессия без имени')
-    return Group(Text.from_markup(f'[bold]{title}[/]  [dim]{b["id"][:8]}[/]'), Text(''), t,
-                 Text.from_markup('\n[dim]Tab — к списку · Enter — открыть выбранную сессию[/]'))
+    return '  '.join(x for x in (name, STATUS[c._status(r)], tail) if x)
 
 
 def ordered(rows, now=None):
-    """Сегменты в рабочем порядке (KVANT LAB первым). Внутри сначала проекты, где недавно шла работа,
+    """Разделы в рабочем порядке (KVANT LAB первым). Внутри сначала проекты, где недавно шла работа,
     самые свежие выше, потом остальные как на диске; части идут за своим проектом."""
     root = rows[0].path
     rel = lambda r: os.path.relpath(r.path.replace('/.claude/worktrees', ''), root).split('/')
@@ -176,39 +114,131 @@ def ordered(rows, now=None):
     return out
 
 
+def _line(s, n):
+    return c._cut(' '.join(s.split()), n)
+
+
+def _lit(text, words):
+    t = Text(text)
+    if words:
+        t.highlight_words(words, 'bold yellow', case_sensitive=False)
+    return t
+
+
+def session_line(item, words=(), here=None):
+    """Строка списка: имя (у гостя — откуда запущена), справа «ждёт ответа», «идёт» или «робот» и когда."""
+    name = _lit(item['name'], words)
+    if here is not None and item['row'] is not here:
+        name.append(f'  · из {nice_name(item["row"])}', 'dim')
+    live, tags = item['live'] or {}, Text(no_wrap=True)
+    if live.get('blocked'):
+        tags.append('ждёт ответа  ', 'bold yellow')
+    elif live:
+        tags.append('идёт  ', 'green')
+    if item['brief']['auto']:
+        tags.append('робот  ', 'dim')
+    tags.append(c.when(item['brief']['last']), 'dim')
+    t = Table.grid(expand=True)
+    t.add_column(ratio=1, no_wrap=True, overflow='ellipsis')
+    t.add_column(no_wrap=True, justify='right')
+    t.add_row(name, tags)
+    return t
+
+
+def folder_line(r, words=()):
+    t = _lit(nice_name(r), words)
+    if r.what:
+        t.append('  ' + _line(r.what, 200), 'dim')
+    t.no_wrap, t.overflow = True, 'ellipsis'
+    return t
+
+
+def detail_view(item, d):
+    """Что внутри сессии: где запущена и где работала, когда, первый и последний запрос, чем кончилась."""
+    b, live = item['brief'], item['live']
+    t = Table.grid(padding=(0, 2))
+    t.add_column(style='dim', no_wrap=True)
+    t.add_column(ratio=1)
+    add = lambda k, v, style='': t.add_row(k, Text(v, style))
+    where = f'запущена в {nice_name(item["row"])}'
+    if d and d['places']:
+        where += ' · работала: ' + ', '.join(f'{p} {n}%' for p, n in d['places'])
+    add('где', where)
+    when = [f'начата {c.when(b["started"])}' if b['started'] else '', f'последняя запись {c.when(b["last"])}']
+    if d and d['branch'] not in ('', 'HEAD'):
+        when.append(f'ветка {d["branch"]}')
+    add('когда', ' · '.join(x for x in when if x))
+    if b['first'] and b['first'] != c.CONTINUED:
+        add('первый запрос', _line(b['first'], 300))
+    elif b['first'] == c.CONTINUED:
+        add('первый запрос', c.CONTINUED)
+    last_user = (d or {}).get('last_user') or b['last_user']
+    if last_user and _line(last_user, 300) != _line(b['first'], 300):
+        add('последний запрос', _line(last_user, 300))
+    if live and live.get('blocked'):
+        add('сейчас', 'ждёт вашего ответа', 'bold yellow')
+    elif live and live.get('kind') == 'interactive':
+        add('сейчас', 'открыта в другом терминале — переключитесь туда', 'green')
+    elif live:
+        add('сейчас', 'идёт прямо сейчас', 'green')
+    elif d and d['error'] in BROKEN:
+        add('чем кончилась', f'оборвалась: {d["error"]} — откройте и напишите «продолжи»', 'yellow')
+    elif d and d['error'] == 'без ответа':
+        add('чем кончилась', 'последний запрос остался без ответа', 'yellow')
+    if d is None:
+        add('', 'читаю стенограмму…', 'dim')
+    elif d['last_answer']:
+        add('последний ответ', _line(d['last_answer'], 400))
+    head = Text(item['name'], 'bold')
+    head.append(f'  {b["id"][:8]}', 'dim')
+    return Group(head, Text(''), t)
+
+
+def folder_view(r):
+    parts = [Text(nice_name(r), 'bold')]
+    if r.what:
+        parts += [Text(''), Text(r.what)]
+    if r.where:
+        parts.append(Text(f'где живёт: {r.where}', 'dim'))
+    parts += [Text(''), Text('Enter — новая сессия в этой папке', 'dim')]
+    return Group(*parts)
+
+
+class FolderTree(Tree):
+    """Дерево папок: → ведёт к сессиям папки (у Tree стрелка вправо прокручивает вбок)."""
+    BINDINGS = [Binding('right', 'app.to_work', show=False)]
+
+
 class Pult(App):
     TITLE = 'Claude · пульт'
     ENABLE_COMMAND_PALETTE = False
     CSS = """
     Screen { layout: vertical; }
-    #hello { height: auto; padding: 1 2 0 2; color: $text-muted; }
-    #body { height: 1fr; padding: 1 1 0 1; }
-    #tree { width: 40%; min-width: 34; padding: 0 1; background: $surface;
-            border: round $primary 50%; border-title-color: $primary; border-title-style: bold; }
-    #tree:focus { border: round $primary; }
-    #card { width: 1fr; margin-left: 1; padding: 0 2; background: $surface;
-            border: round $secondary 50%; border-title-color: $secondary; border-title-style: bold;
-            border-subtitle-color: $text-muted; }
-    #card:focus-within { border: round $secondary; }
-    #title { color: $text-muted; margin-top: 1; }
+    #modes { height: 1; margin: 1 2 0 2; }
+    #switch { height: 1fr; }
+    #sessions { padding: 0 1; }
+    #q { margin: 1 1 0 1; }
+    #sbody { height: 1fr; margin-top: 1; }
+    #list { width: 55%; border: none; padding: 0 1; background: $surface; }
+    #detail { width: 1fr; padding: 0 2; border-left: solid $primary 40%; }
+    #folders { padding: 1 1 0 1; }
+    #tree { width: 40%; padding: 0 1; background: $surface; }
+    #card { width: 1fr; padding: 0 2; border-left: solid $primary 40%; }
     #what { margin-top: 1; }
     #meta { color: $text-muted; }
-    #buttons { height: auto; margin: 1 0 0 0; }
+    #buttons { height: auto; margin-top: 1; }
     #buttons Button { margin-right: 2; padding: 0 1; }
-    #new, #resume { background: $panel; }
-    #name_box { height: auto; display: none; margin-top: 1; }
-    #name_box.show { display: block; }
-    .section { margin-top: 1; color: $accent; text-style: bold; }
-    #live { height: auto; max-height: 6; border: none; padding: 0; background: $surface; }
-    #sessions { height: 1fr; min-height: 3; border: none; padding: 0; background: $surface; }
-    #detail { height: auto; max-height: 18; margin: 1 0; padding: 1 2; background: $boost;
-              border-left: wide $accent; }
+    #work_h { margin-top: 1; color: $accent; text-style: bold; }
+    #work { height: 1fr; border: none; padding: 0; background: $surface; }
+    #name_box { height: auto; padding: 0 2; border-top: solid $accent; }
+    #hint { height: 1; margin: 0 2; color: $text-muted; }
     """
     BINDINGS = [
-        Binding('q', 'quit', 'выход'), Binding('escape', 'back', 'назад', show=False),
-        Binding('enter', 'go_continue', 'продолжить', priority=False),
-        Binding('n', 'go_new', 'новая сессия'), Binding('r', 'go_resume', 'все сессии'),
-        Binding('tab', 'app.focus_next', 'папки ⇄ сессии', priority=True),
+        Binding('tab', 'switch', 'сессии ⇄ папки', priority=True),
+        Binding('escape', 'back', show=False),
+        Binding('up', 'move(-1)', show=False), Binding('down', 'move(1)', show=False),
+        Binding('pageup', 'move(-10)', show=False), Binding('pagedown', 'move(10)', show=False),
+        Binding('c', 'go_continue', show=False), Binding('n', 'go_new', show=False), Binding('q', 'quit', show=False),
     ]
 
     def __init__(self, rows):
@@ -216,53 +246,66 @@ class Pult(App):
         self.now = time.time()
         self.rows = ordered(rows, self.now)
         self.current = self.rows[0]
-        self.briefs, self.details = {}, {}
+        self.new_row = None
+        self.items = None              # общий список сессий, читается в фоне
+        self.picks, self.work_picks = {}, {}
+        self.details = {}
 
+    # ---------- раскладка ----------
     def compose(self) -> ComposeResult:
-        yield Static(greeting(self.rows), id='hello')
-        with Horizontal(id='body'):
-            tree = Tree(tree_label(self.rows[0]), data=self.rows[0], id='tree')
-            tree.auto_expand = False     # раскрытие решает on_tree_node_selected: Enter на корне продолжает
-            tree.root.expand()
-            by_path = {self.rows[0].path: tree.root}
-            stale = {r.path for r in self.rows if r.depth == 2 and not c.is_fresh(r, self.now)}
-            busy = {os.path.dirname(r.path) for r in self.rows if r.depth == 2 and c.is_fresh(r, self.now)}
-            old = {}                    # сегмент → свёрнутый узел «давно не открывались»
-            for r in self.rows[1:]:
-                if not c.visible(r):
-                    continue
-                up = os.path.dirname(r.path.replace('/.claude/worktrees', ''))
-                parent = by_path.get(up)
-                if parent is None:
-                    continue
-                if r.path in stale:
-                    if up not in old:
-                        n = sum(1 for s in stale if os.path.dirname(s) == up)
-                        old[up] = parent.add(f'[dim]давно не открывались · {n}[/]', expand=False)
-                    parent = old[up]
-                node = parent.add(tree_label(r), data=r, expand=(r.depth == 1 and r.path in busy), allow_expand=False)
-                by_path[r.path] = node
-            for node in by_path.values():
-                if node.children:
-                    node.allow_expand = True
-            yield tree
-            with Vertical(id='card'):
-                yield Static('', id='title')
-                yield Static('', id='what')
-                yield Static('', id='meta')
-                with Horizontal(id='buttons'):
-                    yield Button('▶ Продолжить', id='continue', variant='primary', compact=True)
-                    yield Button('＋ Новая сессия', id='new', compact=True)
-                    yield Button('↺ Все сессии', id='resume', compact=True)
-                with Vertical(id='name_box'):
-                    yield Static('', id='name_label')
-                    yield Input(placeholder='направление, например «бизнес» (можно пусто)', id='name')
-                yield Static('Живые сессии', id='live_h', classes='section')
-                yield OptionList(id='live')
-                yield Static('', id='sess_h', classes='section')
-                yield OptionList(id='sessions')
-                yield Static('', id='detail')
-        yield Footer()
+        yield Static(self.modes('sessions'), id='modes')
+        with ContentSwitcher(initial='sessions', id='switch'):
+            with Vertical(id='sessions'):
+                yield Input(placeholder='найти: слово из названия, запроса или имени папки', id='q')
+                with Horizontal(id='sbody'):
+                    yield OptionList(id='list')
+                    yield Static('', id='detail')
+            with Horizontal(id='folders'):
+                yield self.tree()
+                with Vertical(id='card'):
+                    yield Static('', id='title')
+                    yield Static('', id='what')
+                    yield Static('', id='meta')
+                    with Horizontal(id='buttons'):
+                        yield Button('Новая сессия здесь', id='new', variant='primary', compact=True)
+                        yield Button('Продолжить последнюю', id='continue', compact=True)
+                    yield Static('', id='work_h')
+                    yield OptionList(id='work')
+        with Vertical(id='name_box'):
+            yield Static('', id='name_label')
+            yield Input(placeholder='о чём сессия, например «бизнес» (можно пусто)', id='name')
+        yield Static(HINTS['sessions'], id='hint')
+
+    def tree(self):
+        tree = FolderTree(tree_label(self.rows[0]), data=self.rows[0], id='tree')
+        tree.auto_expand = False         # раскрытие решает on_tree_node_selected
+        tree.root.expand()
+        by_path = {self.rows[0].path: tree.root}
+        stale = {r.path for r in self.rows if r.depth == 2 and not c.is_fresh(r, self.now)}
+        busy = {os.path.dirname(r.path) for r in self.rows if r.depth == 2 and c.is_fresh(r, self.now)}
+        old = {}                         # раздел → свёрнутый узел «давно не открывались»
+        for r in self.rows[1:]:
+            if not c.visible(r):
+                continue
+            up = os.path.dirname(r.path.replace('/.claude/worktrees', ''))
+            parent = by_path.get(up)
+            if parent is None:
+                continue
+            if r.path in stale:
+                if up not in old:
+                    n = sum(1 for s in stale if os.path.dirname(s) == up)
+                    old[up] = parent.add(f'[dim]давно не открывались · {n}[/]', expand=False)
+                parent = old[up]
+            by_path[r.path] = parent.add(tree_label(r), data=r, expand=(r.depth == 1 and r.path in busy), allow_expand=False)
+        for node in by_path.values():
+            if node.children:
+                node.allow_expand = True
+        return tree
+
+    def modes(self, mode):
+        on, off = '[reverse bold] {} [/]', '[dim] {} [/]'
+        s, f = (on, off) if mode == 'sessions' else (off, on)
+        return f'{s.format("Сессии")} {f.format("Папки")}   [dim]Tab — переключить[/]'
 
     def on_mount(self):
         try:
@@ -270,207 +313,230 @@ class Pult(App):
         except Exception:
             pass
         for b in self.query(Button):
-            b.can_focus = False         # Tab ходит только между деревом и списками
-        self.query_one('#tree').border_title = ' Папки '
-        self.show(self.rows[0])
-        self.query_one('#tree').focus()
+            b.can_focus = False
+        self.query_one('#name_box').display = False
+        self.show_folder(self.rows[0])
+        self.fill_list()
+        self.query_one('#q').focus()
+        self.load_items()
 
-    # ---------- карточка ----------
-    def show(self, r):
-        self.current = r
-        path = r.path.replace(c.H, '~')
-        card = self.query_one('#card')
-        card.border_title = f' {esc(nice_name(r))} '
-        card.border_subtitle = f'в открытой сессии: /cd {esc(path)}'
-        self.query_one('#title', Static).update(esc(path))
-        self.query_one('#what', Static).update(esc(c._cut(r.what, 180 if r.depth < 2 else 300)) if r.what else '')
-        self.query_one('#meta', Static).update(f'где живёт: {esc(r.where)}' if r.where else '')
-        btn = self.query_one('#continue', Button)
-        btn.label = '▶ Продолжить' if r.sessions else '▶ Начать здесь'
-        btn.display = r.depth != 1 or r.sessions > 0
-        self.query_one('#resume', Button).display = bool(r.sessions)
-        live = self.query_one('#live', OptionList)
-        live.clear_options()
-        seen = set()
-        for s in r.live:
-            sid = s.get('sessionId')
-            if sid and sid in seen:             # страховка: повтор id валит OptionList
-                continue
-            seen.add(sid)
-            tag = 'ждёт ответа' if s['blocked'] else STATES.get(s.get('state'), s.get('state') or '')
-            live.add_option(Option(f'{DOT["ЖДЁТ" if s["blocked"] else "живая"]} {esc(s.get("name") or "")}  [dim]{tag}[/]',
-                                   id=c.open_action(sid, r.live, 'attach') if sid else None))
-        self.query_one('#live_h').display = bool(r.live)
-        live.display = bool(r.live)
-        if r.sessions:
-            more = f'  [dim]показаны последние {LIST_LIMIT}[/]' if r.sessions > LIST_LIMIT else ''
-            head = f'Сессии · {r.sessions}{more}'
-        else:
-            head = 'Сессий здесь пока не было  [dim]«Начать здесь» или n — новая[/]' if r.depth != 1 else \
-                   'Сессий, запущенных прямо отсюда, нет  [dim]они живут в проектах ниже[/]'
-        self.query_one('#sess_h', Static).update(head)
-        self.query_one('#sessions', OptionList).clear_options()
-        self.query_one('#sessions').display = bool(r.sessions)
-        self.query_one('#detail').display = False
-        self.query_one('#name_box').remove_class('show')
-        self.briefs, self.details = {}, {}
-        if r.sessions:
-            self.load_sessions(r)
-        else:
-            self.workers.cancel_group(self, 'sessions')
-
-    def _here(self, r):
-        return c._place(r.path, c.ROOT)
-
-    def _post(self, fn, *args):
+    @work(thread=True, exclusive=True, group='items')
+    def load_items(self):
+        items = c.all_sessions(self.rows)
         try:
-            self.call_from_thread(fn, *args)
-            return True
-        except RuntimeError:        # окно уже закрыто («App is not running»)
-            return False
+            self.call_from_thread(self.set_items, items)
+        except RuntimeError:          # окно уже закрыто
+            pass
 
-    @work(thread=True, exclusive=True, group='sessions')
-    def load_sessions(self, r):
-        worker = get_current_worker()
-        briefs = []
-        for f in c.folder_sessions(r.path, LIST_LIMIT):
-            try:
-                briefs.append(c.session_brief(f))
-            except OSError:
-                continue
-        if worker.is_cancelled or not self._post(self.fill_sessions, r, briefs):
+    def set_items(self, items):
+        self.items = items
+        self.fill_list()
+        self.show_folder(self.current)
+
+    @property
+    def mode(self):
+        return self.query_one('#switch').current
+
+    # ---------- сессии ----------
+    def fill_list(self):
+        lst = self.query_one('#list', OptionList)
+        lst.clear_options()
+        self.picks = {}
+        if self.items is None:
+            lst.add_option(Option(Text('читаю сессии…', 'dim'), disabled=True))
             return
-        for b in briefs:
-            if worker.is_cancelled:
-                return
-            try:
-                d = c.session_detail(b['file'])
-            except OSError:
-                continue
-            if not self._post(self.fill_detail, r, b['id'], d):
-                return
+        query = self.query_one('#q', Input).value
+        words = c._words(query)
+        found, dirs = c.find_sessions(self.items, query), c.find_folders(self.rows, query)
+        opts = []
+        for n, it in enumerate(found):
+            self.picks[f's{n}'] = ('s', it)
+            opts.append(Option(session_line(it, words), id=f's{n}'))
+        if not found and not dirs:
+            opts.append(Option(Text('ничего не нашлось' if words else 'сессий пока нет', 'dim'), disabled=True))
+        if dirs:
+            opts.append(Option(Text('Новая сессия в папке', 'bold'), disabled=True))
+            for n, r in enumerate(dirs):
+                self.picks[f'd{n}'] = ('d', r)
+                opts.append(Option(folder_line(r, words), id=f'd{n}'))
+        lst.add_options(opts)
+        first = next((i for i, o in enumerate(opts) if not o.disabled), None)
+        lst.highlighted = first
+        if first is None:
+            self.query_one('#detail', Static).update('')
+        else:
+            self.show_pick(opts[first].id)
 
-    @work(thread=True, exclusive=True, group='one')
-    def load_one(self, r, b):
+    def show_pick(self, oid):
+        pick = self.picks.get(oid)
+        det = self.query_one('#detail', Static)
+        if pick is None:
+            return
+        kind, x = pick
+        if kind == 'd':
+            det.update(folder_view(x))
+            return
+        f = x['brief']['file']
+        det.update(detail_view(x, self.details.get(f)))
+        if f not in self.details:
+            self.load_detail(oid, x)
+
+    @work(thread=True, exclusive=True, group='detail')
+    def load_detail(self, oid, item):
         try:
-            d = c.session_detail(b['file'])
+            d = c.session_detail(item['brief']['file'])
         except OSError:
             return
-        self._post(self.fill_detail, r, b['id'], d)
+        try:
+            self.call_from_thread(self.fill_detail, oid, item, d)
+        except RuntimeError:
+            pass
 
-    def fill_sessions(self, r, briefs):
-        if self.current is not r:
-            return
-        live = {s.get('sessionId'): s['blocked'] for s in r.live}
-        lst = self.query_one('#sessions', OptionList)
-        lst.clear_options()
-        self.briefs = {b['id']: b for b in briefs}
-        lst.add_options([Option(session_line(b, self.details.get(b['id']), self._here(r), live), id=b['id']) for b in briefs])
-        if briefs:
-            lst.highlighted = 0
-            self.show_detail(briefs[0]['id'])
-
-    def fill_detail(self, r, sid, d):
-        if self.current is not r or sid not in self.briefs:
-            return
-        self.details[sid] = d
-        lst = self.query_one('#sessions', OptionList)
-        live = {s.get('sessionId'): s['blocked'] for s in r.live}
-        lst.replace_option_prompt(sid, session_line(self.briefs[sid], d, self._here(r), live))
+    def fill_detail(self, oid, item, d):
+        self.details[item['brief']['file']] = d
+        lst = self.query_one('#list', OptionList)
         hi = lst.highlighted_option
-        if hi is not None and hi.id == sid:
-            self.show_detail(sid)
+        if hi is not None and hi.id == oid and self.picks.get(oid, (None, None))[1] is item:
+            self.query_one('#detail', Static).update(detail_view(item, d))
 
-    def show_detail(self, sid):
-        b = self.briefs.get(sid)
-        if b is None:
-            return
-        live = next((s for s in self.current.live if s.get('sessionId') == sid), None)
-        det = self.query_one('#detail', Static)
-        det.update(detail_view(b, self.details.get(sid), live))
-        det.display = True
-        if sid not in self.details:
-            self.load_one(self.current, b)
-
-    def on_tree_node_highlighted(self, ev: Tree.NodeHighlighted):
-        if ev.node.data is not None:
-            self.show(ev.node.data)
-
-    def on_tree_node_selected(self, ev: Tree.NodeSelected):
-        r = ev.node.data
-        if r is None:                   # «давно не открывались»: Enter раскрывает
-            ev.node.toggle()
-            return
-        if r.depth >= 2 or (r.depth == 0 and r.sessions):
-            self.finish('continue')
-        else:
-            ev.node.toggle()            # сегмент: Enter раскрывает, продолжает кнопка
-
-    def on_option_list_option_highlighted(self, ev: OptionList.OptionHighlighted):
-        if ev.option_list.id == 'sessions' and ev.option.id:
-            self.show_detail(ev.option.id)
-
-    def on_option_list_option_selected(self, ev: OptionList.OptionSelected):
-        if not ev.option.id:
-            return
-        sessions = ev.option_list.id == 'sessions'
-        action = c.open_action(ev.option.id, self.current.live) if sessions else ev.option.id
+    def open_pick(self, pick):
+        kind, x = pick
+        if kind == 'd':
+            return self.ask_name(x)
+        action = c.open_action(x['brief']['id'], x['row'].live)
         if action.startswith('busy:'):
             self.notify('Эта сессия уже открыта в другом терминале — переключитесь туда.', severity='warning')
             return
-        self.finish(action)
+        self.finish(x['row'], action)
+
+    def on_input_changed(self, ev: Input.Changed):
+        if ev.input.id == 'q':
+            self.fill_list()
+
+    def on_input_submitted(self, ev: Input.Submitted):
+        if ev.input.id == 'name':
+            self.finish(self.new_row, 'new', c.session_name(self.new_row, ev.value.strip()))
+            return
+        hi = self.query_one('#list', OptionList).highlighted_option
+        if hi is not None and hi.id in self.picks:
+            self.open_pick(self.picks[hi.id])
+
+    def on_option_list_option_highlighted(self, ev: OptionList.OptionHighlighted):
+        if ev.option_list.id == 'list' and ev.option.id:
+            self.show_pick(ev.option.id)
+
+    def on_option_list_option_selected(self, ev: OptionList.OptionSelected):
+        picks = self.picks if ev.option_list.id == 'list' else self.work_picks
+        if ev.option.id in picks:
+            self.open_pick(picks[ev.option.id])
+
+    # ---------- папки ----------
+    def show_folder(self, r):
+        self.current = r
+        self.query_one('#title', Static).update(f'[bold]{esc(nice_name(r))}[/]  [dim]{esc(r.path.replace(c.H, "~"))}[/]')
+        self.query_one('#what', Static).update(esc(r.what))
+        self.query_one('#meta', Static).update(f'где живёт: {esc(r.where)}' if r.where else '')
+        self.query_one('#continue', Button).display = bool(r.sessions)
+        guests = set(r.visitors)
+        mine = [i for i in (self.items or []) if i['row'] is r or i['brief']['file'] in guests][:WORK_LIMIT]
+        work = self.query_one('#work', OptionList)
+        work.clear_options()
+        self.work_picks = {f'w{n}': ('s', it) for n, it in enumerate(mine)}
+        work.add_options([Option(session_line(it, here=r), id=f'w{n}') for n, it in enumerate(mine)])
+        if self.items is None:
+            head = 'Работа над этой папкой  [dim]читаю сессии…[/]'
+        elif mine:
+            head = f'Работа над этой папкой · {len(mine)}'
+        else:
+            head = 'Работы здесь пока не было  [dim]Enter — начать[/]'
+        self.query_one('#work_h', Static).update(head)
+
+    def on_tree_node_highlighted(self, ev: Tree.NodeHighlighted):
+        if ev.node.data is not None:
+            self.show_folder(ev.node.data)
+
+    def on_tree_node_selected(self, ev: Tree.NodeSelected):
+        r = ev.node.data
+        if r is None or r.depth == 1:     # «давно не открывались» и разделы: Enter раскрывает
+            ev.node.toggle()
+            return
+        self.ask_name(r)
 
     # ---------- действия ----------
-    def finish(self, action, name=''):
-        self.exit((self.current, action, name))
+    def finish(self, row, action, name=''):
+        self.exit((row, action, name))
 
-    def action_go_continue(self):
-        if self.focused is not None and self.focused.id in ('name', 'live', 'sessions'):
-            return
-        if self.current.depth != 1 or self.current.sessions:
-            self.finish('continue')
-
-    def action_go_new(self):
-        if self.focused is not None and self.focused.id == 'name':
-            return
-        box = self.query_one('#name_box')
-        box.add_class('show')
-        base = c.session_name(self.current, '')
-        self.query_one('#name_label', Static).update(f'Имя новой сессии: [bold]{esc(base)} · …[/]   Enter — запустить, Esc — отмена')
-        inp = self.query_one('#name', Input)
-        inp.value = ''
-        inp.focus()
-
-    def action_go_resume(self):
-        if self.focused is not None and self.focused.id == 'name':
-            return
-        if self.current.sessions:
-            self.finish('resume')
+    def ask_name(self, row):
+        self.new_row = row
+        base = c.session_name(row, '')
+        self.query_one('#name_label', Static).update(
+            f'Новая сессия в [bold]{esc(nice_name(row))}[/], имя «{esc(base)} · …»   [dim]Enter — начать, Esc — отмена[/]')
+        self.query_one('#name', Input).value = ''
+        self.query_one('#name_box').display = True
+        self.query_one('#name', Input).focus()
 
     def _close_name_box(self):
-        if self.query_one('#name_box').has_class('show'):
-            self.query_one('#name_box').remove_class('show')
-            self.query_one('#tree').focus()
-            return True
-        return False
+        box = self.query_one('#name_box')
+        if not box.display:
+            return False
+        box.display = False
+        self.query_one('#q' if self.mode == 'sessions' else '#tree').focus()
+        return True
 
-    def action_quit(self):
-        if not self._close_name_box():
-            self.exit(None)
+    def action_switch(self):
+        self._close_name_box()
+        mode = 'folders' if self.mode == 'sessions' else 'sessions'
+        self.query_one('#switch').current = mode
+        self.query_one('#modes', Static).update(self.modes(mode))
+        self.query_one('#hint', Static).update(HINTS[mode])
+        self.query_one('#q' if mode == 'sessions' else '#tree').focus()
 
     def action_back(self):
         if self._close_name_box():
             return
-        if self.focused is not None and self.focused.id != 'tree':
+        if self.mode == 'sessions':
+            q = self.query_one('#q', Input)
+            if q.value:
+                q.value = ''
+                q.focus()
+                return
+        elif self.focused is not None and self.focused.id == 'work':
             self.query_one('#tree').focus()
             return
         self.exit(None)
 
-    def on_button_pressed(self, ev: Button.Pressed):
-        {'continue': self.action_go_continue, 'new': self.action_go_new, 'resume': self.action_go_resume}[ev.button.id]()
+    def action_move(self, n):
+        if self.mode != 'sessions' or self.focused is None or self.focused.id != 'q':
+            return
+        lst = self.query_one('#list', OptionList)
+        for _ in range(abs(n)):
+            lst.action_cursor_down() if n > 0 else lst.action_cursor_up()
 
-    def on_input_submitted(self, ev: Input.Submitted):
-        self.finish('new', c.session_name(self.current, ev.value.strip()))
+    def action_to_work(self):
+        work = self.query_one('#work', OptionList)
+        if self.mode == 'folders' and self.focused is not None and self.focused.id == 'tree' and work.option_count:
+            work.focus()
+            work.highlighted = 0
+
+    def _in_folders(self):
+        return self.mode == 'folders'          # буквы в полях ввода до привязок окна не доходят
+
+    def action_go_continue(self):
+        if self._in_folders() and self.current.sessions:
+            self.finish(self.current, 'continue')
+
+    def action_go_new(self):
+        if self._in_folders():
+            self.ask_name(self.current)
+
+    def action_quit(self):
+        self.exit(None)
+
+    def on_button_pressed(self, ev: Button.Pressed):
+        if ev.button.id == 'new':
+            self.ask_name(self.current)
+        elif ev.button.id == 'continue':
+            self.finish(self.current, 'continue')
 
 
 def main():
