@@ -216,3 +216,85 @@ class When(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class Activity(unittest.TestCase):
+    """Где недавно шла работа: свои сессии, части, живые, и сессии из корня, уходившие в папку."""
+    DAY = 86400
+
+    def setUp(self):
+        self.root, self.projects = tempfile.mkdtemp(), tempfile.mkdtemp()
+        self.cache = os.path.join(tempfile.mkdtemp(), 'places.json')
+        for p in ('kvant-lab/takt', 'kvant-lab/autovoronka/.claude/worktrees/prod', 'kvant-lab/old', 'work/2026-11-08-check'):
+            os.makedirs(os.path.join(self.root, p))
+        self.now = time.time()
+
+    def session(self, folder, lines, age_days, name='s1', auto=False):
+        d = os.path.join(self.projects, c.encode(os.path.join(self.root, folder) if folder else self.root))
+        os.makedirs(d, exist_ok=True)
+        head = [dict(user('x', cwd=self.root), entrypoint='sdk-cli' if auto else 'cli')]
+        p = write(head + lines, d, name)
+        t = self.now - age_days * self.DAY
+        os.utime(p, (t, t))
+        return p
+
+    def rows(self):
+        rows = c.discover(self.root)
+        for r in rows:                      # как add_stats, только без claude agents и с тестовой папкой стенограмм
+            stamps = [c._mtime(f) for f in c.folder_sessions(r.path, projects=self.projects)]
+            r.sessions, r.last = len(stamps), max(stamps, default=0.0)
+        c.add_activity(rows, now=self.now, projects=self.projects, cache=self.cache)
+        return {r.label: r for r in rows}
+
+    def test_own_part_and_live_sessions(self):
+        self.session('kvant-lab/takt', [], 2)
+        self.session('kvant-lab/autovoronka/.claude/worktrees/prod', [], 1)
+        self.session('kvant-lab/old', [], 30)
+        rows = self.rows()
+        self.assertTrue(c.is_fresh(rows['takt'], self.now))
+        self.assertTrue(c.is_fresh(rows['autovoronka'], self.now))       # работа шла в рабочей копии
+        self.assertFalse(c.is_fresh(rows['old'], self.now))
+        rows['old'].live = [{'sessionId': 'a'}]
+        rows = {r.label: r for r in c.add_activity(list(rows.values()), now=self.now, projects=self.projects, cache=self.cache)}
+        self.assertTrue(c.is_fresh(rows['old'], self.now))
+
+    def test_root_session_lifts_folder_it_worked_in_but_robot_does_not(self):
+        here = os.path.join(self.root, 'kvant-lab', 'old', 'src')
+        self.session('', [answer('y', cwd=here)] * 5, 3)
+        self.session('', [answer('y', cwd=os.path.join(self.root, 'work/2026-11-08-check'))] * 5, 0, 's2', auto=True)
+        rows = self.rows()
+        self.assertTrue(c.is_fresh(rows['old'], self.now))
+        self.assertAlmostEqual(rows['old'].active, self.now - 3 * self.DAY, delta=1)
+        self.assertFalse(c.is_fresh(rows['2026-11-08-check'], self.now))
+
+    def test_root_session_older_than_window_is_not_read(self):
+        p = self.session('', [answer('y', cwd=os.path.join(self.root, 'kvant-lab/old'))] * 5, c.FRESH_DAYS + 1)
+        self.assertFalse(c.is_fresh(self.rows()['old'], self.now))
+        with open(self.cache) as fh:
+            self.assertNotIn(p, json.load(fh)['files'])       # старые стенограммы не читаются вовсе
+
+    def test_cache_reads_only_new_tail(self):
+        p = self.session('', [answer('y', cwd=os.path.join(self.root, 'kvant-lab/old'))] * 5, 1)
+        self.rows()
+        with open(self.cache) as fh:
+            d = json.load(fh)
+        self.assertEqual(d['files'][p]['pos'], os.path.getsize(p))
+        d['files'][p]['counts'] = {'kvant-lab/takt': 1000}       # подмена: если файл перечитан с нуля, её не будет
+        with open(self.cache, 'w') as fh:
+            json.dump(d, fh)
+        with open(p, 'a') as fh:
+            fh.write(json.dumps(answer('z', cwd=os.path.join(self.root, 'work/2026-11-08-check'))) + '\n')
+        os.utime(p, (self.now - self.DAY, self.now - self.DAY))
+        rows = self.rows()
+        self.assertTrue(c.is_fresh(rows['takt'], self.now))
+        with open(self.cache) as fh:
+            self.assertEqual(json.load(fh)['files'][p]['counts']['work/2026-11-08-check'], 1)
+
+    def test_broken_cache_gives_same_answer_as_cold(self):
+        p = self.session('', [answer('y', cwd=os.path.join(self.root, 'kvant-lab/old'))] * 5, 1)
+        cold = {k: r.active for k, r in self.rows().items()}
+        for junk in ('не json', json.dumps({'root': self.root, 'files': {p: {'pos': 10 ** 9, 'counts': {}, 'auto': False}}}),
+                     json.dumps({'root': self.root, 'files': {p: {'pos': 'x'}}}), json.dumps({'root': '/elsewhere', 'files': {}})):
+            with open(self.cache, 'w') as fh:
+                fh.write(junk)
+            self.assertEqual({k: r.active for k, r in self.rows().items()}, cold, junk)

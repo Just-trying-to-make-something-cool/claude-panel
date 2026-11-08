@@ -1,7 +1,9 @@
 """Панель управления папками Claude: окно в терминале (Textual). Данные и запуск — в core.py.
 
-Слева дерево ~/claude: корень, сегменты → проекты → части. У каждого видно, когда была последняя сессия,
-у корня и сегментов — сколько сессий запущено прямо из них. Справа карточка выбранного: описание,
+Слева дерево ~/claude: корень, сегменты → проекты → части. В сегменте сверху проекты, где работа шла
+за последние две недели (c.FRESH_DAYS), свежие выше; остальные свёрнуты в «давно не открывались».
+У проекта видно, когда в нём последний раз работали, у корня и сегментов — сколько сессий запущено
+прямо из них. Справа карточка выбранного: описание,
 где живёт, кнопки «Продолжить», «Новая сессия», «Все сессии», живые сессии и список сессий папки.
 Под списком — что внутри выбранной сессии: первый и последний запрос, чем закончилась, где шла работа.
 
@@ -74,8 +76,10 @@ def tree_label(r):
         if not (r.what or r.sessions) and r.depth == 2:
             name = f'[dim]{name}[/]'
     tail = ''
-    if r.sessions:
-        tail = f'[dim]{sessions_word(r.sessions)} · {c._ago(r.last)}[/]' if r.depth < 2 else f'[dim]{c._ago(r.last)}[/]'
+    if r.depth < 2 and r.sessions:
+        tail = f'[dim]{sessions_word(r.sessions)} · {c._ago(r.last)}[/]'
+    elif r.depth >= 2 and r.active:
+        tail = f'[dim]{c._ago(r.active)}[/]'
     return '  '.join(x for x in (name, DOT[c._status(r)], tail) if x)
 
 
@@ -156,15 +160,19 @@ def detail_view(b, d, live=None):
                  Text.from_markup('\n[dim]Tab — к списку · Enter — открыть выбранную сессию[/]'))
 
 
-def ordered(rows):
-    """Сегменты в рабочем порядке (KVANT LAB первым), внутри — как на диске."""
+def ordered(rows, now=None):
+    """Сегменты в рабочем порядке (KVANT LAB первым). Внутри сначала проекты, где недавно шла работа,
+    самые свежие выше, потом остальные как на диске; части идут за своим проектом."""
     root = rows[0].path
-    seg_of = lambda r: os.path.relpath(r.path, root).split('/')[0]
-    segs = sorted({seg_of(r) for r in rows if r.depth >= 1},
+    rel = lambda r: os.path.relpath(r.path.replace('/.claude/worktrees', ''), root).split('/')
+    segs = sorted({rel(r)[0] for r in rows if r.depth >= 1},
                   key=lambda s: (SEG_ORDER.index(s) if s in SEG_ORDER else 99, s))
     out = [rows[0]]
     for seg in segs:
-        out += [r for r in rows if r.depth >= 1 and seg_of(r) == seg]
+        mine = [r for r in rows if r.depth >= 1 and rel(r)[0] == seg]
+        out += [r for r in mine if r.depth == 1]
+        for p in sorted((r for r in mine if r.depth == 2), key=lambda r: -r.active if c.is_fresh(r, now) else 1):
+            out += [p] + [r for r in mine if r.depth == 3 and rel(r)[:2] == rel(p)[:2]]
     return out
 
 
@@ -205,7 +213,8 @@ class Pult(App):
 
     def __init__(self, rows):
         super().__init__()
-        self.rows = ordered(rows)
+        self.now = time.time()
+        self.rows = ordered(rows, self.now)
         self.current = self.rows[0]
         self.briefs, self.details = {}, {}
 
@@ -216,13 +225,22 @@ class Pult(App):
             tree.auto_expand = False     # раскрытие решает on_tree_node_selected: Enter на корне продолжает
             tree.root.expand()
             by_path = {self.rows[0].path: tree.root}
+            stale = {r.path for r in self.rows if r.depth == 2 and not c.is_fresh(r, self.now)}
+            busy = {os.path.dirname(r.path) for r in self.rows if r.depth == 2 and c.is_fresh(r, self.now)}
+            old = {}                    # сегмент → свёрнутый узел «давно не открывались»
             for r in self.rows[1:]:
                 if not c.visible(r):
                     continue
-                parent = by_path.get(os.path.dirname(r.path.replace('/.claude/worktrees', '')))
+                up = os.path.dirname(r.path.replace('/.claude/worktrees', ''))
+                parent = by_path.get(up)
                 if parent is None:
                     continue
-                node = parent.add(tree_label(r), data=r, expand=(r.depth == 1 and r.label == SEG_ORDER[0]), allow_expand=False)
+                if r.path in stale:
+                    if up not in old:
+                        n = sum(1 for s in stale if os.path.dirname(s) == up)
+                        old[up] = parent.add(f'[dim]давно не открывались · {n}[/]', expand=False)
+                    parent = old[up]
+                node = parent.add(tree_label(r), data=r, expand=(r.depth == 1 and r.path in busy), allow_expand=False)
                 by_path[r.path] = node
             for node in by_path.values():
                 if node.children:
@@ -380,7 +398,8 @@ class Pult(App):
 
     def on_tree_node_selected(self, ev: Tree.NodeSelected):
         r = ev.node.data
-        if r is None:
+        if r is None:                   # «давно не открывались»: Enter раскрывает
+            ev.node.toggle()
             return
         if r.depth >= 2 or (r.depth == 0 and r.sessions):
             self.finish('continue')
@@ -455,7 +474,7 @@ class Pult(App):
 
 
 def main():
-    rows = c.add_stats(c.discover())
+    rows = c.add_activity(c.add_stats(c.discover()))
     result = Pult(rows).run()
     if result:
         row, action, name = result
