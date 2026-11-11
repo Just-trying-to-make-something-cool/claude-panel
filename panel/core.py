@@ -501,10 +501,11 @@ def display_name(b, row):
     папки («nicky», «nicky (2)») — первая строка первого запроса; у продолжения после предела контекста
     первый запрос служебный — тогда последний запрос."""
     t = ' '.join(b['title'].split())
-    for p in {row.project, row.label} - {''}:
+    names = list(dict.fromkeys(x for x in (row.project, row.label) if x))   # проект, потом часть — как в session_name
+    for p in names:
         if t.startswith(p + ' · '):
             t = t[len(p) + 3:]
-    if t and not re.fullmatch('(%s)( \\(\\d+\\))?' % '|'.join(map(re.escape, {row.project, row.label} - {''})), t):
+    if t and not re.fullmatch('(%s)( \\(\\d+\\))?' % '|'.join(map(re.escape, names)), t):
         return t
     if b['first'] == CONTINUED:
         return _line1(b['last_user']) or 'продолжение прошлой сессии'
@@ -516,10 +517,11 @@ def all_sessions(rows, projects=None):
     Без служебных копий субагентов и без прогонов без человека, кроме ждущих ответа. Ждущие ответа
     первыми, дальше свежие выше."""
     out = []
+    # claude agents группирует живые по cwd агента, а не по папке запуска: ищем по всем папкам
+    live = {s.get('sessionId'): s for r in rows for s in r.live if s.get('sessionId')}
     for r in rows:
-        if r.depth == 3 and AGENT_WT.match(r.label):
+        if not visible(r):
             continue
-        live = {s.get('sessionId'): s for s in r.live}
         for f in folder_sessions(r.path, projects=projects):
             try:
                 b = session_brief(f)
@@ -557,8 +559,7 @@ def find_folders(rows, query, limit=5):
     words = _words(query)
     if not words:
         return []
-    hit = [r for r in rows if r.depth >= 1 and not (r.depth == 3 and AGENT_WT.match(r.label))
-           and _has(words, r.label, r.what if r.depth >= 2 else '')]
+    hit = [r for r in rows if r.depth >= 1 and visible(r) and _has(words, r.label, r.what if r.depth >= 2 else '')]
     return sorted(hit, key=lambda r: -r.active)[:limit]
 
 

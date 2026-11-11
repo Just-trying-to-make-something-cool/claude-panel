@@ -344,6 +344,10 @@ class DisplayName(unittest.TestCase):
     def test_part_named_after_itself_shows_first_prompt(self):
         self.assertEqual(c.display_name(self.b('autovoronka · base-check'), self.part), 'проверь, что с переездом')
 
+    def test_part_prefix_stripped_project_then_label(self):
+        # раньше приписки снимались в порядке множества — от запуска к запуску имя менялось
+        self.assertEqual(c.display_name(self.b('autovoronka · base-check · бизнес'), self.part), 'бизнес')
+
     def test_continuation_without_title_never_shows_service_phrase(self):
         self.assertEqual(c.display_name(self.b('', c.CONTINUED, 'доделай КП'), self.proj), 'доделай КП')
         self.assertEqual(c.display_name(self.b('', c.CONTINUED, ''), self.proj), 'продолжение прошлой сессии')
