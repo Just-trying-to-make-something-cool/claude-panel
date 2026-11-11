@@ -31,8 +31,7 @@ from textual.widgets import Button, ContentSwitcher, Input, OptionList, Static, 
 from textual.widgets.option_list import Option  # noqa: E402
 
 SEG_ORDER = ['kvant-lab', 'clients', 'infra', 'personal', 'work', 'claude-settings']
-SEG_NAMES = {'kvant-lab': 'KVANT LAB', 'clients': 'Клиенты', 'infra': 'Инфра', 'personal': 'Личное',
-             'work': 'Разовые задачи', 'claude-settings': 'Настройки Claude'}
+SEG_NAMES = c.SEG_NAMES
 ATTN = 'bold yellow'      # единственный цвет в тексте — то, что ждёт человека; остальное — обычный и тусклый
 STATUS = {'ЖДЁТ': f'[{ATTN}]ждёт ответа[/]', 'работает': '[dim]идёт[/]', 'живая': '[dim]открыта[/]', '': ''}
 THEME = os.environ.get('C_THEME', 'nord')
@@ -121,16 +120,21 @@ def _lit(text, words):
     return t
 
 
+def live_word(s):
+    """Одно слово для живой сессии — то же правило, что у дерева (core._status)."""
+    if s.get('blocked'):
+        return 'ждёт ответа'
+    return 'идёт' if s.get('state') in ('busy', 'working') else 'открыта'
+
+
 def session_line(item, words=(), here=None):
     """Строка списка: имя (у гостя — откуда запущена), справа «ждёт ответа», «идёт» или «робот» и когда."""
     name = _lit(item['name'], words)
     if here is not None and item['row'] is not here:
         name.append(f'  · из {nice_name(item["row"])}', 'dim')
     live, tags = item['live'] or {}, Text(no_wrap=True)
-    if live.get('blocked'):
-        tags.append('ждёт ответа  ', ATTN)
-    elif live:
-        tags.append('идёт  ', 'dim')
+    if live:
+        tags.append(live_word(live) + '  ', ATTN if live.get('blocked') else 'dim')
     if item['brief']['auto']:
         tags.append('робот  ', 'dim')
     tags.append(c.when(item['brief']['last']), 'dim')
@@ -175,8 +179,10 @@ def detail_view(item, d):
         add('сейчас', 'ждёт вашего ответа', ATTN)
     elif live and live.get('kind') == 'interactive':
         add('сейчас', 'открыта в другом терминале — переключитесь туда')
-    elif live:
+    elif live and live_word(live) == 'идёт':
         add('сейчас', 'идёт прямо сейчас')
+    elif live:
+        add('сейчас', 'открыта в фоне, сейчас ничего не делает')
     elif d and d['error'] == 'ошибка входа':
         add('чем кончилась', 'оборвалась на ошибке входа — откройте, выполните /login и напишите «продолжи»', ATTN)
     elif d and d['error'] == 'лимит':
@@ -314,6 +320,7 @@ class Pult(App):
             pass
         for b in self.query(Button):
             b.can_focus = False
+        self.query_one('#list').can_focus = False     # клик выбирает строку, а буквы по-прежнему идут в поиск
         self.query_one('#name_box').display = False
         self.show_folder(self.rows[0])
         self.fill_list()

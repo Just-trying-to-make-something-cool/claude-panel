@@ -517,7 +517,8 @@ def all_sessions(rows, projects=None):
     Без служебных копий субагентов и без прогонов без человека, кроме ждущих ответа. Ждущие ответа
     первыми, дальше свежие выше."""
     out = []
-    # claude agents группирует живые по cwd агента, а не по папке запуска: ищем по всем папкам
+    # живые сгруппированы по cwd из claude agents; совпадает ли он всегда с папкой запуска, не проверено
+    # (на замере 11.11 совпал) — ищем по всем папкам, так «открыта в другом терминале» не потеряется
     live = {s.get('sessionId'): s for r in rows for s in r.live if s.get('sessionId')}
     for r in rows:
         if not visible(r):
@@ -544,13 +545,18 @@ def _has(words, *texts):
     return all(w in hay for w in words)
 
 
+SEG_NAMES = {'kvant-lab': 'KVANT LAB', 'clients': 'Клиенты', 'infra': 'Инфра', 'personal': 'Личное',
+             'work': 'Разовые задачи', 'claude-settings': 'Настройки Claude'}   # так разделы подписаны в окне
+
+
 def find_sessions(items, query):
     """Сессии, где все слова запроса (регистр и ё не важны) есть в имени, названии, первом или последнем
     запросе либо в имени папки запуска; описание папки — только у проектов и частей: описание раздела
     перечисляет все его проекты, и «лид» находил бы всё, что запущено из раздела. Пустой запрос — все."""
     words = _words(query)
     return [i for i in items if _has(words, i['name'], i['brief']['title'], i['brief']['first'], i['brief']['last_user'],
-                                     i['row'].label, i['row'].what if i['row'].depth >= 2 else '')]
+                                     i['row'].label, SEG_NAMES.get(i['row'].label, ''),
+                                     i['row'].what if i['row'].depth >= 2 else '')]
 
 
 def find_folders(rows, query, limit=5):
@@ -559,7 +565,8 @@ def find_folders(rows, query, limit=5):
     words = _words(query)
     if not words:
         return []
-    hit = [r for r in rows if r.depth >= 1 and visible(r) and _has(words, r.label, r.what if r.depth >= 2 else '')]
+    hit = [r for r in rows if r.depth >= 1 and visible(r)
+           and _has(words, r.label, SEG_NAMES.get(r.label, ''), r.what if r.depth >= 2 else '')]
     return sorted(hit, key=lambda r: -r.active)[:limit]
 
 

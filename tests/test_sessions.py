@@ -430,4 +430,6 @@ class Find(unittest.TestCase):
         rows = [root, seg, avto, gate, takt, agent]
         self.assertEqual([r.label for r in c.find_folders(rows, 'лид')], ['kvant-gate', 'avto_lead'])
         self.assertEqual(c.find_folders(rows, ''), [])
+        clients = c.Row('/r/clients', 1, 'clients', 'заказные работы')
+        self.assertEqual([r.label for r in c.find_folders(rows + [clients], 'клиенты')], ['clients'])   # как подписан в окне
         self.assertEqual(len(c.find_folders(rows, 'а', limit=2)), 2)
