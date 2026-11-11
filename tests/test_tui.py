@@ -225,6 +225,7 @@ class Sessions(unittest.IsolatedAsyncioTestCase):
             await pilot.press('enter')
             await pilot.pause()
             self.assertTrue(app.is_running)
+            self.assertTrue(any('другом терминале' in str(n.message) for n in app._notifications))
         self.assertIsNone(app.return_value)
 
     async def test_session_live_under_other_folder_is_still_busy(self):
@@ -233,11 +234,43 @@ class Sessions(unittest.IsolatedAsyncioTestCase):
         app = c_tui.Pult(self.w.rows)
         async with app.run_test() as pilot:
             await sessions(app, pilot)
-            self.assertIn('идёт', shown(app)[0][1])
+            self.assertIn('открыта', shown(app)[0][1])          # без состояния busy/working — не «идёт»
             await pilot.press('enter')
             await pilot.pause()
             self.assertTrue(app.is_running)
         self.assertIsNone(app.return_value)
+
+    async def test_working_and_idle_live_sessions_are_told_apart(self):
+        self.w.row('takt').live = [{'sessionId': self.w.takt, 'kind': 'background', 'id': 't1', 'blocked': False, 'state': 'working'}]
+        self.w.row('kvant-lab').live = [{'sessionId': self.w.leads, 'kind': 'background', 'id': 'l1', 'blocked': False, 'state': 'idle'}]
+        app = c_tui.Pult(self.w.rows)
+        async with app.run_test() as pilot:
+            await sessions(app, pilot)
+            texts = dict((t.split()[0], t) for _, t in shown(app))
+            self.assertIn('открыта', texts['горячие'])
+            self.assertIn('идёт', texts['бизнес'])
+
+    async def test_click_on_row_opens_it_and_letters_stay_in_search(self):
+        app = c_tui.Pult(self.w.rows)
+        async with app.run_test() as pilot:
+            await sessions(app, pilot)
+            app.query_one('#list').focus()
+            self.assertEqual(app.focused.id, 'q')                   # список фокус не забирает
+            await pilot.click('#list', offset=(3, 0))
+            await pilot.pause()
+        self.assertEqual(app.return_value[1], f'session:{self.w.leads}')
+
+    async def test_stale_detail_of_other_session_is_ignored(self):
+        app = c_tui.Pult(self.w.rows)
+        async with app.run_test() as pilot:
+            await sessions(app, pilot)
+            await ready(app, pilot)
+            before = c_tui.plain(app.query_one('#detail').content)
+            _, other = app.picks['s1']
+            app.fill_detail('s1', other, {'places': [], 'branch': '', 'last_user': 'чужое', 'last_answer': 'чужой ответ', 'error': ''})
+            await pilot.pause()
+            self.assertNotIn('чужой ответ', c_tui.plain(app.query_one('#detail').content))
+            self.assertEqual(c_tui.plain(app.query_one('#detail').content), before)
 
     async def test_q_in_list_does_not_quit(self):
         app = c_tui.Pult(self.w.rows)
@@ -256,6 +289,8 @@ class Sessions(unittest.IsolatedAsyncioTestCase):
             first = shown(app)[0][1]
             self.assertIn('почему РОП', first)
             self.assertIn('ждёт ответа', first)
+            await ready(app, pilot)
+            self.assertIn('ждёт вашего ответа', c_tui.plain(app.query_one('#detail').content))
 
     async def test_enter_on_folder_asks_name_then_starts_new(self):
         app = c_tui.Pult(self.w.rows)
@@ -414,6 +449,49 @@ class Folders(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(app.return_value[1], 'session:mine')
         finally:
             w.close()
+
+    async def test_segment_without_sessions_hides_continue(self):
+        app = c_tui.Pult(self.w.rows)
+        async with app.run_test() as pilot:
+            await self.go(app, pilot, 'clients')
+            self.assertFalse(app.query_one('#continue').display)
+            await pilot.press('c')
+            await pilot.pause()
+            self.assertTrue(app.is_running)
+
+    async def test_buttons_continue_and_new(self):
+        app = c_tui.Pult(self.w.rows)
+        async with app.run_test() as pilot:
+            await self.go(app, pilot, 'takt')
+            app.query_one('#new').press()
+            await pilot.pause()
+            self.assertTrue(app.query_one('#name_box').display)
+            await pilot.press('escape')
+            app.query_one('#continue').press()
+            await pilot.pause()
+        self.assertEqual(app.return_value[1], f'session:{self.w.takt}')
+
+    async def test_n_opens_name_box(self):
+        app = c_tui.Pult(self.w.rows)
+        async with app.run_test() as pilot:
+            await self.go(app, pilot, 'takt')
+            await pilot.press('n')
+            await pilot.pause()
+            self.assertEqual(app.focused.id, 'name')
+            await pilot.press(*'план', 'enter')
+        self.assertEqual(app.return_value, (self.w.row('takt'), 'new', 'takt · план'))
+
+    async def test_escape_from_folder_sessions_goes_back_to_tree(self):
+        app = c_tui.Pult(self.w.rows)
+        async with app.run_test() as pilot:
+            await self.go(app, pilot, 'takt')
+            await pilot.press('right')
+            await pilot.pause()
+            self.assertEqual(app.focused.id, 'work')
+            await pilot.press('escape')
+            await pilot.pause()
+            self.assertEqual(app.focused.id, 'tree')
+            self.assertTrue(app.is_running)
 
     async def test_card_shows_count_and_when(self):
         app = c_tui.Pult(self.w.rows)
