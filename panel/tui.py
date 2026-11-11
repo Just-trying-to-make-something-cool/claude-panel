@@ -2,16 +2,17 @@
 
 Два режима, Tab переключает.
 
-Сессии — с него окно открывается. Строка поиска, под ней все ваши сессии из всех папок ~/claude:
-ждущие ответа первыми, дальше свежие выше. Справа — что внутри выбранной: где запущена и где работала,
-когда, первый и последний запрос, последний ответ. Печатайте слова из названия, запроса или имени папки —
-список сужается, ниже появляются папки, где можно начать новую сессию. ↑↓ выбрать, Enter открыть,
-Esc очистить поиск, ещё раз — выход. Прогоны без человека (claude -p) не показываются.
-
-Папки — дерево ~/claude: в разделе сверху папки, где работа шла за две недели, остальное свёрнуто
-в «давно не открывались». Справа описание папки и работа над ней, в том числе сессии, запущенные
+Папки — с него окно открывается. Дерево ~/claude, только имена: раскрыт KVANT LAB, остальные разделы
+свёрнуты. В разделе сверху папки, где работа шла за две недели, остальное свёрнуто в «давно не
+открывались». Справа описание папки, сколько в ней сессий и последние из них, в том числе запущенные
 из раздела выше. Enter — новая сессия (спросит, о чём; на разделе — раскрыть), c — продолжить
 последнюю, → — к сессиям папки, q — выход. Мышь работает.
+
+Сессии — строка поиска, под ней все ваши сессии из всех папок ~/claude: ждущие ответа первыми,
+дальше свежие выше. Справа — что внутри выбранной: где запущена и где работала, когда, первый
+и последний запрос, последний ответ. Печатайте слова из названия, запроса или имени папки —
+список сужается, ниже появляются папки, где можно начать новую сессию. ↑↓ выбрать, Enter открыть,
+Esc очистить поиск, ещё раз — выход. Прогоны без человека (claude -p) не показываются.
 """
 import io, os, re, sys, time
 
@@ -32,13 +33,14 @@ from textual.widgets.option_list import Option  # noqa: E402
 SEG_ORDER = ['kvant-lab', 'clients', 'infra', 'personal', 'work', 'claude-settings']
 SEG_NAMES = {'kvant-lab': 'KVANT LAB', 'clients': 'Клиенты', 'infra': 'Инфра', 'personal': 'Личное',
              'work': 'Разовые задачи', 'claude-settings': 'Настройки Claude'}
-STATUS = {'ЖДЁТ': '[bold yellow]ждёт ответа[/]', 'работает': '[green]идёт[/]', 'живая': '[green]открыта[/]', '': ''}
+ATTN = 'bold yellow'      # единственный цвет в тексте — то, что ждёт человека; остальное — обычный и тусклый
+STATUS = {'ЖДЁТ': f'[{ATTN}]ждёт ответа[/]', 'работает': '[dim]идёт[/]', 'живая': '[dim]открыта[/]', '': ''}
 THEME = os.environ.get('C_THEME', 'nord')
-WORK_LIMIT = 30
+WORK_LIMIT = 8
 BROKEN = ('ошибка входа', 'ошибка API', 'лимит')
-HINTS = {'sessions': 'Enter — открыть · ↑↓ — выбрать · печатайте, чтобы искать · Tab — папки · Esc — очистить / выход',
-         'folders': 'Enter — новая сессия здесь (на разделе — раскрыть) · c — продолжить последнюю · → — сессии папки'
-                    ' · Tab — сессии · q — выход'}
+OPEN_SEG = 'kvant-lab'    # раскрыт при открытии, как в первой версии окна
+HINTS = {'sessions': 'Enter — открыть · ↑↓ — выбрать · печатайте, чтобы искать · Tab — папки · Esc — выход',
+         'folders': 'Enter — новая сессия · c — продолжить · → — сессии папки · Tab — поиск сессий · q — выход'}
 
 
 def esc(s):
@@ -81,21 +83,15 @@ def nice_name(r):
 
 
 def tree_label(r):
-    """У корня и разделов — число своих сессий, у проектов — когда в них последний раз работали."""
-    if r.depth == 0:
-        name = '[bold]~/claude[/]'
-    elif r.depth == 1:
+    """Только имя и, если в папке идёт сессия, её состояние. Числа и даты — в карточке справа:
+    в дереве они делали каждую строку пёстрой и мешали читать имена."""
+    if r.depth < 2:
         name = f'[bold]{esc(nice_name(r))}[/]'
     else:
         name = esc(r.label)
         if not (r.what or r.sessions) and r.depth == 2:
             name = f'[dim]{name}[/]'
-    tail = ''
-    if r.depth < 2 and r.sessions:
-        tail = f'[dim]{sessions_word(r.sessions)} · {c._ago(r.last)}[/]'
-    elif r.depth >= 2 and r.active:
-        tail = f'[dim]{c._ago(r.active)}[/]'
-    return '  '.join(x for x in (name, STATUS[c._status(r)], tail) if x)
+    return '  '.join(x for x in (name, STATUS[c._status(r)]) if x)
 
 
 def ordered(rows, now=None):
@@ -121,7 +117,7 @@ def _line(s, n):
 def _lit(text, words):
     t = Text(text)
     if words:
-        t.highlight_words(words, 'bold yellow', case_sensitive=False)
+        t.highlight_words(words, 'bold underline', case_sensitive=False)
     return t
 
 
@@ -132,9 +128,9 @@ def session_line(item, words=(), here=None):
         name.append(f'  · из {nice_name(item["row"])}', 'dim')
     live, tags = item['live'] or {}, Text(no_wrap=True)
     if live.get('blocked'):
-        tags.append('ждёт ответа  ', 'bold yellow')
+        tags.append('ждёт ответа  ', ATTN)
     elif live:
-        tags.append('идёт  ', 'green')
+        tags.append('идёт  ', 'dim')
     if item['brief']['auto']:
         tags.append('робот  ', 'dim')
     tags.append(c.when(item['brief']['last']), 'dim')
@@ -178,15 +174,15 @@ def detail_view(item, d):
     if last_user and _line(last_user, 300) != _line(b['first'], 300):
         add('последний запрос', _line(last_user, 300))
     if live and live.get('blocked'):
-        add('сейчас', 'ждёт вашего ответа', 'bold yellow')
+        add('сейчас', 'ждёт вашего ответа', ATTN)
     elif live and live.get('kind') == 'interactive':
-        add('сейчас', 'открыта в другом терминале — переключитесь туда', 'green')
+        add('сейчас', 'открыта в другом терминале — переключитесь туда')
     elif live:
-        add('сейчас', 'идёт прямо сейчас', 'green')
+        add('сейчас', 'идёт прямо сейчас')
     elif d and d['error'] in BROKEN:
-        add('чем кончилась', f'оборвалась: {d["error"]} — откройте и напишите «продолжи»', 'yellow')
+        add('чем кончилась', f'оборвалась: {d["error"]} — откройте и напишите «продолжи»', ATTN)
     elif d and d['error'] == 'без ответа':
-        add('чем кончилась', 'последний запрос остался без ответа', 'yellow')
+        add('чем кончилась', 'последний запрос остался без ответа')
     if d is None:
         add('', 'читаю стенограмму…', 'dim')
     elif d['last_answer']:
@@ -230,8 +226,8 @@ class Pult(App):
     #meta { color: $text-muted; }
     #buttons { height: auto; margin-top: 1; }
     #buttons Button { margin-right: 2; padding: 0 1; }
-    #work_h { margin-top: 1; color: $accent; text-style: bold; }
-    #work { height: 1fr; border: none; padding: 0; background: $surface; }
+    #work_h { margin-top: 2; text-style: bold; }
+    #work { height: auto; max-height: 1fr; max-width: 90; border: none; padding: 0; background: transparent; }
     #name_box { height: auto; padding: 0 2; border-top: solid $accent; }
     #hint { height: 1; margin: 0 2; color: $text-muted; }
     """
@@ -255,8 +251,8 @@ class Pult(App):
 
     # ---------- раскладка ----------
     def compose(self) -> ComposeResult:
-        yield Static(self.modes('sessions'), id='modes')
-        with ContentSwitcher(initial='sessions', id='switch'):
+        yield Static(self.modes('folders'), id='modes')
+        with ContentSwitcher(initial='folders', id='switch'):
             with Vertical(id='sessions'):
                 yield Input(placeholder='найти: слово из названия, запроса или имени папки', id='q')
                 with Horizontal(id='sbody'):
@@ -276,7 +272,7 @@ class Pult(App):
         with Vertical(id='name_box'):
             yield Static('', id='name_label')
             yield Input(placeholder='о чём сессия, например «бизнес» (можно пусто)', id='name')
-        yield Static(HINTS['sessions'], id='hint')
+        yield Static(HINTS['folders'], id='hint')
 
     def tree(self):
         tree = FolderTree(tree_label(self.rows[0]), data=self.rows[0], id='tree')
@@ -284,7 +280,6 @@ class Pult(App):
         tree.root.expand()
         by_path = {self.rows[0].path: tree.root}
         stale = {r.path for r in self.rows if r.depth == 2 and not c.is_fresh(r, self.now)}
-        busy = {os.path.dirname(r.path) for r in self.rows if r.depth == 2 and c.is_fresh(r, self.now)}
         old = {}                         # раздел → свёрнутый узел «давно не открывались»
         for r in self.rows[1:]:
             if not c.visible(r):
@@ -298,7 +293,8 @@ class Pult(App):
                     n = sum(1 for s in stale if os.path.dirname(s) == up)
                     old[up] = parent.add(f'[dim]давно не открывались · {n}[/]', expand=False)
                 parent = old[up]
-            by_path[r.path] = parent.add(tree_label(r), data=r, expand=(r.depth == 1 and r.path in busy), allow_expand=False)
+            by_path[r.path] = parent.add(tree_label(r), data=r, expand=(r.depth == 1 and r.label == OPEN_SEG),
+                                         allow_expand=False)
         for node in by_path.values():
             if node.children:
                 node.allow_expand = True
@@ -306,8 +302,8 @@ class Pult(App):
 
     def modes(self, mode):
         on, off = '[reverse bold] {} [/]', '[dim] {} [/]'
-        s, f = (on, off) if mode == 'sessions' else (off, on)
-        return f'{s.format("Сессии")} {f.format("Папки")}   [dim]Tab — переключить[/]'
+        f, s = (on, off) if mode == 'folders' else (off, on)
+        return f'{f.format("Папки")} {s.format("Сессии")}'
 
     def on_mount(self):
         try:
@@ -319,7 +315,7 @@ class Pult(App):
         self.query_one('#name_box').display = False
         self.show_folder(self.rows[0])
         self.fill_list()
-        self.query_one('#q').focus()
+        self.query_one('#tree').focus()
         self.load_items()
 
     @work(thread=True, exclusive=True, group='items')
@@ -435,22 +431,30 @@ class Pult(App):
     # ---------- папки ----------
     def show_folder(self, r):
         self.current = r
-        self.query_one('#title', Static).update(f'[bold]{esc(nice_name(r))}[/]  [dim]{esc(r.path.replace(c.H, "~"))}[/]')
+        path = r.path.replace(c.H, '~')
+        title = f'[bold]{esc(nice_name(r))}[/]'
+        self.query_one('#title', Static).update(title if path == nice_name(r) else f'{title}  [dim]{esc(path)}[/]')
         self.query_one('#what', Static).update(esc(r.what))
-        self.query_one('#meta', Static).update(f'где живёт: {esc(r.where)}' if r.where else '')
+        meta = [f'где живёт: {esc(r.where)}'] if r.where else []
+        if r.sessions:
+            meta.append(f'{sessions_word(r.sessions)}, последняя {c._ago(r.last)}')
+        self.query_one('#meta', Static).update('\n'.join(meta))
         self.query_one('#continue', Button).display = bool(r.sessions)
         guests = set(r.visitors)
-        mine = [i for i in (self.items or []) if i['row'] is r or i['brief']['file'] in guests][:WORK_LIMIT]
+        mine = [i for i in (self.items or []) if i['row'] is r or i['brief']['file'] in guests]
+        shown = mine[:WORK_LIMIT]
         work = self.query_one('#work', OptionList)
         work.clear_options()
-        self.work_picks = {f'w{n}': ('s', it) for n, it in enumerate(mine)}
-        work.add_options([Option(session_line(it, here=r), id=f'w{n}') for n, it in enumerate(mine)])
+        self.work_picks = {f'w{n}': ('s', it) for n, it in enumerate(shown)}
+        work.add_options([Option(session_line(it, here=r), id=f'w{n}') for n, it in enumerate(shown)])
         if self.items is None:
-            head = 'Работа над этой папкой  [dim]читаю сессии…[/]'
+            head = 'Последние сессии  [dim]читаю…[/]'
+        elif len(mine) > len(shown):
+            head = f'Последние сессии  [dim]{len(shown)} из {len(mine)}, остальные — Tab, поиск[/]'
         elif mine:
-            head = f'Работа над этой папкой · {len(mine)}'
+            head = 'Последние сессии'
         else:
-            head = 'Работы здесь пока не было  [dim]Enter — начать[/]'
+            head = 'Сессий здесь пока не было  [dim]Enter — начать[/]'
         self.query_one('#work_h', Static).update(head)
 
     def on_tree_node_highlighted(self, ev: Tree.NodeHighlighted):
