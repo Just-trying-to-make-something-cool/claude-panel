@@ -91,6 +91,16 @@ class Markup(unittest.TestCase):
             self.assertIn(raw.replace('\\', '').rstrip('\\')[:3], plain)
 
 
+class Broken(unittest.TestCase):
+    def test_login_and_limit_say_what_to_do(self):
+        item = {'name': 'x', 'live': None, 'row': c.Row('/r/a', 2, 'a', project='a'),
+                'brief': {'id': 'abc', 'started': 0, 'last': 0, 'first': 'q', 'last_user': ''}}
+        d = {'places': [], 'branch': '', 'last_user': '', 'last_answer': '', 'error': ''}
+        text = lambda err: c_tui.plain(c_tui.detail_view(item, dict(d, error=err)))
+        self.assertIn('/login', text('ошибка входа'))
+        self.assertIn('когда лимит обновится', text('лимит'))
+
+
 class Order(unittest.TestCase):
     def test_kvant_lab_first_then_clients(self):
         w = World()
@@ -217,6 +227,27 @@ class Sessions(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(app.is_running)
         self.assertIsNone(app.return_value)
 
+    async def test_session_live_under_other_folder_is_still_busy(self):
+        # claude agents группирует по cwd агента: сессия из KVANT LAB может числиться в takt
+        self.w.row('takt').live = [{'sessionId': self.w.leads, 'kind': 'interactive', 'blocked': False}]
+        app = c_tui.Pult(self.w.rows)
+        async with app.run_test() as pilot:
+            await sessions(app, pilot)
+            self.assertIn('идёт', shown(app)[0][1])
+            await pilot.press('enter')
+            await pilot.pause()
+            self.assertTrue(app.is_running)
+        self.assertIsNone(app.return_value)
+
+    async def test_q_in_list_does_not_quit(self):
+        app = c_tui.Pult(self.w.rows)
+        async with app.run_test() as pilot:
+            await sessions(app, pilot)
+            app.query_one('#list').focus()
+            await pilot.press('q')
+            await pilot.pause()
+            self.assertTrue(app.is_running)
+
     async def test_waiting_session_is_on_top_and_marked(self):
         self.w.row('autovoronka').live = [{'sessionId': self.w.rop, 'kind': 'background', 'id': 'b1', 'blocked': True}]
         app = c_tui.Pult(self.w.rows)
@@ -323,7 +354,7 @@ class Folders(unittest.IsolatedAsyncioTestCase):
             await self.go(app, pilot, 'takt')
             await pilot.press('c')
         row, action, name = app.return_value
-        self.assertEqual((row.label, action), ('takt', 'continue'))
+        self.assertEqual((row.label, action), ('takt', f'session:{self.w.takt}'))   # именно последняя человеческая, не claude -c
 
     async def test_enter_on_segment_toggles(self):
         app = c_tui.Pult(self.w.rows)
@@ -361,6 +392,28 @@ class Folders(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(labels['takt'], 'takt')                   # без «вчера», «1 сессия» и дат
             self.assertEqual(labels['kvant-lab'], 'KVANT LAB')
             self.assertEqual(labels[self.w.rows[0].label], '~/claude')
+
+    async def test_continue_skips_newer_robot_run(self):
+        # в корне свежий прогон робота и вчерашняя человеческая: c продолжает человеческую, а не claude -c
+        root = self.w.rows[0]
+        app = c_tui.Pult(self.w.rows)
+        async with app.run_test() as pilot:
+            await ready(app, pilot)
+            self.assertIs(app.current, root)
+            self.assertFalse(app.query_one('#continue').display)     # своих человеческих в корне нет
+            await pilot.press('c')
+            await pilot.pause()
+            self.assertTrue(app.is_running)
+        w = World(extra=[('', 'mine', [say('разбери почту', self.w.root)])])
+        try:
+            app = c_tui.Pult(w.rows)
+            async with app.run_test() as pilot:
+                await ready(app, pilot)
+                self.assertIn('1 сессия', c_tui.plain(app.query_one('#meta').content))   # робот не в счёт
+                await pilot.press('c')
+            self.assertEqual(app.return_value[1], 'session:mine')
+        finally:
+            w.close()
 
     async def test_card_shows_count_and_when(self):
         app = c_tui.Pult(self.w.rows)

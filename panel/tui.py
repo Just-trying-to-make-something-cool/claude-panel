@@ -166,10 +166,8 @@ def detail_view(item, d):
     if d and d['branch'] not in ('', 'HEAD'):
         when.append(f'ветка {d["branch"]}')
     add('когда', ' · '.join(x for x in when if x))
-    if b['first'] and b['first'] != c.CONTINUED:
+    if b['first']:
         add('первый запрос', _line(b['first'], 300))
-    elif b['first'] == c.CONTINUED:
-        add('первый запрос', c.CONTINUED)
     last_user = (d or {}).get('last_user') or b['last_user']
     if last_user and _line(last_user, 300) != _line(b['first'], 300):
         add('последний запрос', _line(last_user, 300))
@@ -179,6 +177,10 @@ def detail_view(item, d):
         add('сейчас', 'открыта в другом терминале — переключитесь туда')
     elif live:
         add('сейчас', 'идёт прямо сейчас')
+    elif d and d['error'] == 'ошибка входа':
+        add('чем кончилась', 'оборвалась на ошибке входа — откройте, выполните /login и напишите «продолжи»', ATTN)
+    elif d and d['error'] == 'лимит':
+        add('чем кончилась', 'оборвалась на лимите — когда лимит обновится, откройте и напишите «продолжи»', ATTN)
     elif d and d['error'] in BROKEN:
         add('чем кончилась', f'оборвалась: {d["error"]} — откройте и напишите «продолжи»', ATTN)
     elif d and d['error'] == 'без ответа':
@@ -401,7 +403,7 @@ class Pult(App):
         kind, x = pick
         if kind == 'd':
             return self.ask_name(x)
-        action = c.open_action(x['brief']['id'], x['row'].live)
+        action = c.open_action(x['brief']['id'], [x['live']] if x['live'] else [])
         if action.startswith('busy:'):
             self.notify('Эта сессия уже открыта в другом терминале — переключитесь туда.', severity='warning')
             return
@@ -436,10 +438,15 @@ class Pult(App):
         self.query_one('#title', Static).update(title if path == nice_name(r) else f'{title}  [dim]{esc(path)}[/]')
         self.query_one('#what', Static).update(esc(r.what))
         meta = [f'где живёт: {esc(r.where)}'] if r.where else []
-        if r.sessions:
-            meta.append(f'{sessions_word(r.sessions)}, последняя {c._ago(r.last)}')
+        if self.items is None:
+            n, last = r.sessions, r.last
+        else:                              # прогоны робота не в счёт: их нет и в списке ниже
+            own = self.own_sessions(r)
+            n, last = len(own), max((i['brief']['last'] for i in own), default=0)
+        if n:
+            meta.append(f'{sessions_word(n)}, последняя {c._ago(last)}')
         self.query_one('#meta', Static).update('\n'.join(meta))
-        self.query_one('#continue', Button).display = bool(r.sessions)
+        self.query_one('#continue', Button).display = bool(n)
         guests = set(r.visitors)
         mine = [i for i in (self.items or []) if i['row'] is r or i['brief']['file'] in guests]
         shown = mine[:WORK_LIMIT]
@@ -527,22 +534,39 @@ class Pult(App):
     def _in_folders(self):
         return self.mode == 'folders'          # буквы в полях ввода до привязок окна не доходят
 
+    def own_sessions(self, r):
+        """Человеческие сессии, запущенные в самой папке (без гостей и прогонов робота)."""
+        return [i for i in (self.items or []) if i['row'] is r and not i['brief']['auto']]
+
+    def continue_here(self):
+        """Последняя человеческая сессия папки. `claude -c` взял бы самую свежую стенограмму —
+        в корне это утренний прогон робота; он остаётся, только пока список сессий не прочитан."""
+        r = self.current
+        if self.items is None:
+            if r.sessions:
+                self.finish(r, 'continue')
+            return
+        own = self.own_sessions(r)
+        if own:
+            self.open_pick(('s', max(own, key=lambda i: i['brief']['last'])))
+
     def action_go_continue(self):
-        if self._in_folders() and self.current.sessions:
-            self.finish(self.current, 'continue')
+        if self._in_folders():
+            self.continue_here()
 
     def action_go_new(self):
         if self._in_folders():
             self.ask_name(self.current)
 
     def action_quit(self):
-        self.exit(None)
+        if self._in_folders():                 # в «Сессиях» q — буква поиска, выход там — Esc
+            self.exit(None)
 
     def on_button_pressed(self, ev: Button.Pressed):
         if ev.button.id == 'new':
             self.ask_name(self.current)
         elif ev.button.id == 'continue':
-            self.finish(self.current, 'continue')
+            self.continue_here()
 
 
 def main():
