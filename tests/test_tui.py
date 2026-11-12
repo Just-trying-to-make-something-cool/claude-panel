@@ -257,7 +257,7 @@ class Sessions(unittest.IsolatedAsyncioTestCase):
             app.query_one('#list').focus()
             await pilot.pause()
             self.assertEqual(app.focused.id, 'q')                   # список фокус не забирает
-            await pilot.click('#list', offset=(3, 0))
+            await pilot.click('#list', offset=(3, 1))               # строка 0 — рамка списка
             await pilot.pause()
         self.assertEqual(app.return_value[1], f'session:{self.w.leads}')
 
@@ -352,6 +352,25 @@ class Folders(unittest.IsolatedAsyncioTestCase):
         tree.move_cursor(node)
         await pilot.pause()
 
+    async def test_card_says_where_work_stopped_and_continues_guest(self):
+        # в kvant-radar своих сессий нет, но работала сессия из KVANT LAB: карточка показывает запрос и ответ,
+        # C продолжает её (откроется в KVANT LAB, где запущена)
+        app = c_tui.Pult(self.w.rows)
+        async with app.run_test() as pilot:
+            await self.go(app, pilot, 'kvant-radar')
+            for _ in range(20):
+                if 'читаю' not in c_tui.plain(app.query_one('#last').content):
+                    break
+                await pilot.pause(0.05)
+            last = c_tui.plain(app.query_one('#last').content)
+            self.assertIn('оцени письма', last)
+            self.assertIn('Claude', last)
+            self.assertIn('ок', last)
+            self.assertTrue(app.query_one('#continue').display)
+            self.assertIn('горячие лиды', last)                       # о какой сессии речь
+            await pilot.press('c')
+        self.assertEqual(app.return_value[1], f'session:{self.w.leads}')
+
     async def test_tab_switches_modes_and_focus(self):
         app = c_tui.Pult(self.w.rows)
         async with app.run_test() as pilot:
@@ -426,7 +445,7 @@ class Folders(unittest.IsolatedAsyncioTestCase):
             await ready(app, pilot)
             self.assertEqual((app.query_one('#switch').current, app.focused.id), ('folders', 'tree'))
             labels = {n.data.label: c_tui.plain(n.label).strip() for n in c_tui.walk(app.query_one('#tree').root) if n.data}
-            self.assertEqual(labels['takt'], 'takt')                   # без «вчера», «1 сессия» и дат
+            self.assertEqual(labels['takt'], 'takt  таск-менеджер')    # имя и что это; без «вчера», «1 сессия» и дат
             self.assertEqual(labels['kvant-lab'], 'KVANT LAB')
             self.assertEqual(labels[self.w.rows[0].label], '~/claude')
 
