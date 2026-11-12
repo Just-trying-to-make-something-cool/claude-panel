@@ -255,6 +255,7 @@ class Sessions(unittest.IsolatedAsyncioTestCase):
         async with app.run_test() as pilot:
             await sessions(app, pilot)
             app.query_one('#list').focus()
+            await pilot.pause()
             self.assertEqual(app.focused.id, 'q')                   # список фокус не забирает
             await pilot.click('#list', offset=(3, 0))
             await pilot.pause()
@@ -277,6 +278,7 @@ class Sessions(unittest.IsolatedAsyncioTestCase):
         async with app.run_test() as pilot:
             await sessions(app, pilot)
             app.query_one('#list').focus()
+            await pilot.pause()
             await pilot.press('q')
             await pilot.pause()
             self.assertTrue(app.is_running)
