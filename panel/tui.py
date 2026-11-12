@@ -2,17 +2,19 @@
 
 Два режима, Tab переключает.
 
-Папки — с него окно открывается. Дерево ~/claude, только имена: раскрыт KVANT LAB, остальные разделы
-свёрнуты. В разделе сверху папки, где работа шла за две недели, остальное свёрнуто в «давно не
-открывались». Справа описание папки, сколько в ней сессий и последние из них, в том числе запущенные
-из раздела выше. Enter — новая сессия (спросит, о чём; на разделе — раскрыть), c — продолжить
-последнюю, → — к сессиям папки, q — выход. Мышь работает.
+Папки — с него окно открывается. Слева дерево ~/claude: у папки имя и коротко «что это», точка —
+состояние сессии (жёлтая — ждёт ответа, зелёная — идёт). Раскрыт KVANT LAB; в разделе сверху папки,
+где работа шла за две недели, остальное свёрнуто в «давно не открывались». Справа карточка папки:
+кнопки «⏎ Новая сессия», «C Продолжить», «→ Сессии папки», описание, «Где остановились» (последняя
+сессия: твой запрос и ответ Claude) и сессии папки карточками. q — выход. Мышь работает.
 
-Сессии — строка поиска, под ней все ваши сессии из всех папок ~/claude: ждущие ответа первыми,
+Все сессии — строка поиска, под ней все ваши сессии из всех папок ~/claude: ждущие ответа первыми,
 дальше свежие выше. Справа — что внутри выбранной: где запущена и где работала, когда, первый
 и последний запрос, последний ответ. Печатайте слова из названия, запроса или имени папки —
 список сужается, ниже появляются папки, где можно начать новую сессию. ↑↓ выбрать, Enter открыть,
 Esc очистить поиск, ещё раз — выход. Прогоны без человека (claude -p) не показываются.
+
+Тема окна — pult (кобальт на тёмном); другая встроенная тема Textual: C_THEME=nord c.
 """
 import io, os, re, sys, time
 
@@ -27,6 +29,7 @@ from textual.app import App, ComposeResult  # noqa: E402
 from textual.binding import Binding  # noqa: E402
 from textual.containers import Horizontal, Vertical, VerticalScroll  # noqa: E402
 from textual.content import Content  # noqa: E402
+from textual.geometry import Region  # noqa: E402
 from textual.theme import Theme  # noqa: E402
 from textual.widgets import Button, ContentSwitcher, Input, OptionList, Static, Tree  # noqa: E402
 from textual.widgets.option_list import Option  # noqa: E402
@@ -50,6 +53,11 @@ HINTS = {'sessions': '   '.join(KEY.format(k, v) for k, v in (
          'folders': '   '.join(KEY.format(k, v) for k, v in (
              ('⏎', 'новая сессия'), ('C', 'продолжить'), ('→', 'сессии папки'), ('↑↓', 'папки'),
              ('Tab', 'поиск по всем сессиям'), ('Q', 'выход')))}
+HINTS_SHORT = {'sessions': '  '.join(KEY.format(k, v) for k, v in (('⏎', 'открыть'), ('↑↓', ''), ('Tab', 'папки'), ('Esc', 'выход'))),
+               'folders': '  '.join(KEY.format(k, v) for k, v in (('⏎', 'новая'), ('C', 'продолжить'), ('→', 'сессии'),
+                                                                   ('Tab', 'поиск'), ('Q', 'выход')))}
+NARROW = 130              # уже — короткие подписи кнопок и подсказок, без счётчика в шапке
+BUTTONS = {'new': ('⏎  Новая сессия', '⏎ Новая'), 'continue': ('C  Продолжить', 'C Продолжить'), 'all': ('→  Сессии папки', '→ Сессии')}
 
 
 def esc(s):
@@ -276,6 +284,8 @@ class Pult(App):
     ENABLE_COMMAND_PALETTE = False
     CSS = """
     Screen { layout: vertical; background: $background; }
+    * { scrollbar-background: $surface; scrollbar-background-hover: $surface; scrollbar-background-active: $surface;
+        scrollbar-color: $panel-lighten-2; scrollbar-color-hover: $accent 60%; scrollbar-size-vertical: 1; }
     #top { height: 3; padding: 1 2 0 2; background: $panel; }
     #brand { width: auto; color: $accent; text-style: bold; margin-right: 3; }
     #modes { width: auto; height: 1; }
@@ -296,7 +306,7 @@ class Pult(App):
     #tree > .tree--guides, #tree > .tree--guides-hover, #tree > .tree--guides-selected { color: $panel-lighten-1; }
     #card { width: 1fr; padding: 1 2; margin-left: 1; border: round $panel-lighten-2; scrollbar-size-vertical: 1; }
     #title { height: auto; }
-    #what { margin-top: 1; }
+    #what { }
     #meta { color: $text-muted; margin-top: 1; }
     .sec { margin-top: 1; color: $accent; text-style: bold; }
     #last { height: auto; padding: 0 1; border-left: thick $accent 60%; background: $boost; }
@@ -346,12 +356,12 @@ class Pult(App):
                 yield self.tree()
                 with VerticalScroll(id='card'):
                     yield Static('', id='title')
-                    yield Static('', id='what')
-                    yield Static('', id='meta')
                     with Horizontal(id='buttons'):
                         yield Button('⏎  Новая сессия', id='new')
                         yield Button('C  Продолжить', id='continue')
-                        yield Button('→  Все сессии', id='all')
+                        yield Button('→  Сессии папки', id='all')
+                    yield Static('', id='what')
+                    yield Static('', id='meta')
                     yield Static('Где остановились', id='last_h', classes='sec')
                     yield Static('', id='last')
                     yield Static('', id='work_h', classes='sec')
@@ -407,6 +417,18 @@ class Pult(App):
         parts = [f'[{ATTN}]● ждут ответа: {wait}[/]' if wait else '', f'[{GO}]● идут: {run}[/]' if run else '']
         return '   '.join(p for p in parts if p) or 'все сессии спокойны'
 
+    def fit(self):
+        """Подписи под ширину окна: в узком терминале кнопки и подсказки не обрезаются."""
+        narrow = self.size.width < NARROW
+        self.query_one('#hint', Static).update((HINTS_SHORT if narrow else HINTS)[self.mode])
+        for bid, (wide, short) in BUTTONS.items():
+            self.query_one(f'#{bid}', Button).label = short if narrow else wide
+        self.query_one('#summary').display = self.size.width >= 100
+        self.query_one('#all').display = self.size.width >= 100 and self.query_one('#work', OptionList).option_count > 0
+
+    def on_resize(self, ev):
+        self.fit()
+
     def on_mount(self):
         self.register_theme(PULT)
         try:
@@ -421,6 +443,7 @@ class Pult(App):
         self.fill_list()
         self.query_one('#tree').focus()
         self.load_items()
+        self.fit()
 
     @work(thread=True, exclusive=True, group='items')
     def load_items(self):
@@ -526,6 +549,21 @@ class Pult(App):
     def on_option_list_option_highlighted(self, ev: OptionList.OptionHighlighted):
         if ev.option_list.id == 'list' and ev.option.id:
             self.show_pick(ev.option.id)
+        elif ev.option_list.id == 'work':
+            self.call_after_refresh(self.follow_work)
+
+    def follow_work(self):
+        """Список сессий папки — без своей прокрутки, внутри карточки: карточка едет за выбранной."""
+        work, card = self.query_one('#work', OptionList), self.query_one('#card')
+        h = work.highlighted
+        if h is None:
+            return
+        try:
+            work._update_lines()
+            y, n = work._index_to_line[h], work._heights[h]
+        except (AttributeError, KeyError):
+            return work.scroll_visible()
+        card.scroll_to_region(Region(0, work.virtual_region.y + y, card.size.width, n), animate=False, force=True)
 
     def on_option_list_option_selected(self, ev: OptionList.OptionSelected):
         picks = self.picks if ev.option_list.id == 'list' else self.work_picks
@@ -559,7 +597,7 @@ class Pult(App):
         shown = mine[:WORK_LIMIT]
         latest = self.latest_own(r)
         self.query_one('#continue', Button).display = bool(n or latest)
-        self.query_one('#all', Button).display = bool(shown)
+        self.query_one('#all', Button).display = bool(shown) and self.size.width >= 100   # в узком окне → есть в подсказке
         self.fill_last(r, mine)
         work = self.query_one('#work', OptionList)
         work.clear_options()
@@ -580,17 +618,15 @@ class Pult(App):
             self.load_folder_details(r, need)
 
     def latest_own(self, r):
-        """Что продолжает C: последняя человеческая сессия папки, а если своих нет — последняя
-        зашедшая сюда из раздела выше (откроется там, где запущена)."""
-        own = self.own_sessions(r)
-        if not own:
-            guests = set(r.visitors)
-            own = [i for i in (self.items or []) if i['brief']['file'] in guests and not i['brief']['auto']]
-        return max(own, key=lambda i: i['brief']['last']) if own else None
+        """Что продолжает C и что показано в «Где остановились»: последняя человеческая сессия папки —
+        своя или зашедшая сюда из раздела выше (откроется там, где запущена)."""
+        guests = set(r.visitors)
+        cand = [i for i in (self.items or []) if not i['brief']['auto'] and (i['row'] is r or i['brief']['file'] in guests)]
+        return max(cand, key=lambda i: i['brief']['last']) if cand else None
 
     def fill_last(self, r, mine):
         """«Где остановились»: последняя сессия папки — о чём, когда, твой последний запрос и ответ Claude."""
-        it = mine[0] if mine else None
+        it = self.latest_own(r) or (mine[0] if mine else None)
         box, head = self.query_one('#last', Static), self.query_one('#last_h', Static)
         box.display = head.display = it is not None
         if it is None:
@@ -621,8 +657,8 @@ class Pult(App):
         for it in items:
             try:
                 got[it['brief']['file']] = c.session_detail(it['brief']['file'])
-            except OSError:
-                pass
+            except OSError:              # заглушка: иначе show_folder снова и снова просил бы её прочитать
+                got[it['brief']['file']] = {'last_user': '', 'last_answer': '', 'error': '', 'branch': '', 'places': []}
         try:
             self.call_from_thread(self.fill_folder_details, r, got)
         except RuntimeError:
@@ -673,7 +709,7 @@ class Pult(App):
         mode = 'folders' if self.mode == 'sessions' else 'sessions'
         self.query_one('#switch').current = mode
         self.query_one('#modes', Static).update(self.modes(mode))
-        self.query_one('#hint', Static).update(HINTS[mode])
+        self.fit()
         self.query_one('#q' if mode == 'sessions' else '#tree').focus()
 
     def action_back(self):

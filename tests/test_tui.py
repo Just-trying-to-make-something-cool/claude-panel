@@ -371,6 +371,22 @@ class Folders(unittest.IsolatedAsyncioTestCase):
             await pilot.press('c')
         self.assertEqual(app.return_value[1], f'session:{self.w.leads}')
 
+    async def test_where_stopped_and_c_point_to_same_session(self):
+        # в takt две свои сессии: свежая «бизнес» и старая, ждущая ответа (в списке она первая) —
+        # «Где остановились» и C обе про свежую
+        w = World(extra=[('kvant-lab/takt', 'old', [say('старое дело', '/x')])])
+        try:
+            w.row('takt').live = [{'sessionId': 'old', 'kind': 'background', 'id': 'o1', 'blocked': True, 'state': 'idle'}]
+            app = c_tui.Pult(w.rows)
+            async with app.run_test() as pilot:
+                await self.go(app, pilot, 'takt')
+                self.assertIn('бизнес', c_tui.plain(app.query_one('#last').content))
+                self.assertNotIn('старое дело', c_tui.plain(app.query_one('#last').content))
+                await pilot.press('c')
+            self.assertEqual(app.return_value[1], f'session:{w.takt}')
+        finally:
+            w.close()
+
     async def test_tab_switches_modes_and_focus(self):
         app = c_tui.Pult(self.w.rows)
         async with app.run_test() as pilot:
