@@ -202,5 +202,142 @@ class OpenSession(unittest.TestCase):
         self.assertIn('claude attach a4ff9cb7', err.getvalue())
 
 
+class Live(unittest.TestCase):
+    def test_same_session_in_two_windows_listed_once(self):
+        """Одна сессия, открытая в двух окнах, приходит из `claude agents` дважды: в списке живых она одна."""
+        import json, subprocess, types
+        two = [{'sessionId': 'a1', 'cwd': '/p', 'name': 'x', 'pid': 1}, {'sessionId': 'a1', 'cwd': '/p', 'name': 'x', 'pid': 2},
+               {'sessionId': 'b2', 'cwd': '/p', 'name': 'y', 'pid': 3}]
+        real = subprocess.run
+        subprocess.run = lambda *a, **k: types.SimpleNamespace(stdout=json.dumps(two), returncode=0)
+        try:
+            row = types.SimpleNamespace(path='/p')
+            c.add_stats([row])
+        finally:
+            subprocess.run = real
+        self.assertEqual([s['sessionId'] for s in row.live], ['a1', 'b2'])
+
+
+def _dry_launch(row, action='continue', **env):
+    """Команда запуска, которую напечатал бы launch, — без exec. env подменяет переменные на время вызова."""
+    import contextlib, io
+    env = dict({'C_DRY': '1', 'C_PAIR': '0', 'C_PLAIN': None, 'ZELLIJ': None}, **env)
+    old = {k: os.environ.get(k) for k in env}
+    err = io.StringIO()
+    try:
+        for k, v in env.items():
+            os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+        with contextlib.redirect_stderr(err):
+            c.launch(row, action)
+    finally:
+        for k, v in old.items():
+            os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+    return err.getvalue()
+
+
+class ContinueById(unittest.TestCase):
+    """«Продолжить» открывает последнюю человеческую сессию папки по id, а не `claude -c`: тот сразу
+    выходит, когда последняя сессия идёт в фоне, и берёт самую свежую стенограмму — прогон робота."""
+
+    def setUp(self):
+        import json
+        self.json, self.old = json, c.PROJECTS
+        c.PROJECTS = tempfile.mkdtemp()
+        self.dir = tempfile.mkdtemp()
+        self.row = c.Row(self.dir, 2, 'p', project='p')
+
+    def tearDown(self):
+        c.PROJECTS = self.old
+
+    def session(self, sid, mtime, robot=False):
+        d = os.path.join(c.PROJECTS, c.encode(self.dir))
+        os.makedirs(d, exist_ok=True)
+        f = os.path.join(d, sid + '.jsonl')
+        with open(f, 'w', encoding='utf-8') as fh:
+            fh.write(self.json.dumps({'type': 'user', 'message': {'content': 'задача ' + sid}, 'cwd': self.dir,
+                                      'entrypoint': 'sdk-cli' if robot else 'cli'}) + '\n')
+        os.utime(f, (mtime, mtime))
+        self.row.sessions += 1
+        return f
+
+    def test_last_human_session_by_id(self):
+        self.session('aaaa-old', 1000)
+        self.session('bbbb-new', 2000)
+        self.session('cccc-robot', 3000, robot=True)     # свежее всех, но это claude -p
+        out = _dry_launch(self.row)
+        self.assertIn('claude -r bbbb-new', out)
+        self.assertNotIn('claude -c', out)
+
+    def test_only_robot_runs_take_newest(self):
+        self.session('r1', 1000, robot=True)
+        self.session('r2', 2000, robot=True)
+        self.assertIn('claude -r r2', _dry_launch(self.row))
+
+    def test_background_session_is_attached(self):
+        self.session('bbbb-new', 2000)
+        self.row.live = [{'sessionId': 'bbbb-new', 'kind': 'background', 'id': 'f00d', 'blocked': False}]
+        self.assertIn('claude attach f00d', _dry_launch(self.row))
+
+    def test_open_in_other_terminal_is_not_started_again(self):
+        self.session('bbbb-new', 2000)
+        self.row.live = [{'sessionId': 'bbbb-new', 'kind': 'interactive', 'blocked': False}]
+        out = _dry_launch(self.row)
+        self.assertIn('уже открыта', out)
+        self.assertNotIn('claude -', out)
+
+    def test_no_sessions_starts_new(self):
+        self.assertIn('claude -n p', _dry_launch(self.row))
+
+
+class Pair(unittest.TestCase):
+    """Пара с Codex: `rev --here` из claude-setup, флаг ~/.claude/pair-codex или C_PAIR."""
+
+    def setUp(self):
+        self.bin, self.home, self.old = tempfile.mkdtemp(), tempfile.mkdtemp(), (c.H, os.environ.get('PATH'))
+        rev = os.path.join(self.bin, 'rev')
+        with open(rev, 'w') as fh:
+            fh.write('#!/bin/sh\nexit 0\n')
+        os.chmod(rev, 0o755)
+        os.makedirs(os.path.join(self.home, '.claude'))
+        c.H = self.home
+        os.environ['PATH'] = self.bin + os.pathsep + '/usr/bin:/bin'
+
+    def tearDown(self):
+        c.H, os.environ['PATH'] = self.old
+
+    def on(self, **env):
+        env = dict({'C_PAIR': None, 'C_PLAIN': None, 'ZELLIJ': None}, **env)
+        old = {k: os.environ.get(k) for k in env}
+        try:
+            for k, v in env.items():
+                os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+            return c.pair_on()
+        finally:
+            for k, v in old.items():
+                os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+
+    def test_flag_file_turns_pair_on(self):
+        self.assertFalse(self.on())
+        open(os.path.join(self.home, '.claude', 'pair-codex'), 'w').close()
+        self.assertTrue(self.on())
+        self.assertFalse(self.on(C_PAIR='0'))            # C_PAIR главнее файла
+
+    def test_env_turns_pair_on(self):
+        self.assertTrue(self.on(C_PAIR='1'))
+
+    def test_without_our_rev_no_pair(self):
+        os.environ['PATH'] = '/usr/bin:/bin'             # там только системная rev, переворачивающая строки
+        self.assertFalse(self.on(C_PAIR='1'))
+
+    def test_plain_or_inside_zellij_no_pair(self):
+        self.assertFalse(self.on(C_PAIR='1', C_PLAIN='1'))
+        self.assertFalse(self.on(C_PAIR='1', ZELLIJ='0'))
+
+    def test_launch_goes_through_rev_here(self):
+        out = _dry_launch(c.Row(tempfile.mkdtemp(), 2, 'p', project='p'), 'session:abc', C_PAIR='1')
+        self.assertIn('rev --here · claude -r abc', out)
+        self.assertNotIn('rev --here', _dry_launch(c.Row(tempfile.mkdtemp(), 2, 'p', project='p'), 'session:abc'))
+
+
 if __name__ == '__main__':
     unittest.main()

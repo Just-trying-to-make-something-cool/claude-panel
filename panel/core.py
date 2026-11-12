@@ -14,6 +14,10 @@ c --preview PATH  правая панель (служебное)
 
 Claude запускается внутри zellij (если есть ~/.local/bin/zellij): тогда в окно может печатать пульт агентов
 с телефона. Снаружи всё как раньше. C_PLAIN=1 c — запуск без zellij.
+
+«Продолжить» открывает последнюю человеческую сессию папки по id (claude -r ID, живую фоновую — claude attach).
+Пара с Codex: при файле ~/.claude/pair-codex или C_PAIR=1 сессия запускается через `rev --here` (claude-setup):
+слева Claude, справа Codex-ревьюер. C_PAIR=0 c — без пары.
 """
 import dataclasses, glob, json, os, re, shutil, signal, subprocess, sys, threading, time
 
@@ -735,8 +739,36 @@ def fzf(lines, prompt, header, query='', preview=True, height='80%'):
     return r.stdout.strip().split('\t', 1)[0] if r.returncode == 0 and r.stdout.strip() else ''
 
 
+def last_session(row, scan=50):
+    """id последней сессии папки, начатой человеком; прогоны робота (claude -p) пропускаются.
+    Человеческой среди свежих нет — самая свежая; стенограмм нет — ''."""
+    files = folder_sessions(row.path, scan)
+    for f in files:
+        try:
+            if not session_brief(f)['auto']:
+                return os.path.basename(f)[:-6]
+        except OSError:
+            continue
+    return os.path.basename(files[0])[:-6] if files else ''
+
+
+def pair_on():
+    """Codex-ревьюер справа от каждой сессии: файл ~/.claude/pair-codex или C_PAIR=1, и в PATH есть rev
+    из claude-setup (не системная /usr/bin/rev). rev сам поднимает zellij, поэтому с C_PLAIN=1 и внутри
+    zellij сессия идёт без пары."""
+    if os.environ.get('C_PLAIN') or os.environ.get('ZELLIJ'):
+        return False
+    if os.environ.get('C_PAIR', '1' if os.path.exists(H + '/.claude/pair-codex') else '0') != '1':
+        return False
+    rev = shutil.which('rev')
+    return bool(rev) and not rev.startswith(('/usr/bin/', '/bin/'))
+
+
 def launch(row, action, name=''):
     os.chdir(row.path)
+    if action not in ('resume', 'new') and ':' not in action:   # «продолжить»: последняя сессия по id.
+        last = last_session(row)        # `claude -c` сразу выходит, когда она идёт в фоне, и берёт прогон робота
+        action = open_action(last, row.live) if last else 'new'
     if action == 'resume':
         args = ['claude', '-r']
     elif action.startswith('busy:'):
@@ -746,13 +778,15 @@ def launch(row, action, name=''):
         args = ['claude', 'attach', action[3:]]
     elif action.startswith(('attach:', 'session:')):
         args = ['claude', '-r', action.split(':', 1)[1]]
-    elif action == 'new':
-        args = ['claude', '-n', name or session_name(row, '')]
     else:
-        args = ['claude', '-c'] if row.sessions else ['claude', '-n', session_name(row, '')]
-    print(f'{DIM}→ {row.path.replace(H, "~")}  claude {" ".join(args[1:])}{RST}', file=sys.stderr)
+        args = ['claude', '-n', name or session_name(row, '')]
+    pair = pair_on()                    # это окно станет левым с Claude, Codex-ревьюер откроется справа
+    print(f'{DIM}→ {row.path.replace(H, "~")}  {"rev --here · " if pair else ""}claude {" ".join(args[1:])}{RST}',
+          file=sys.stderr)
     if os.environ.get('C_DRY'):
         return
+    if pair:
+        os.execvp('rev', ['rev', '--here', row.path] + args[1:])
     if os.access(ZELLIJ, os.X_OK) and not os.environ.get('C_PLAIN') and not os.environ.get('ZELLIJ'):
         return in_zellij(row, args)
     os.execvp('claude', args)
